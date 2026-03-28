@@ -15,7 +15,7 @@ This project provides an end-to-end pipeline for social media content automation
 
 | Dashboard Overview | Post Management |
 | :---: | :---: |
-| ![Dashboard Overview Placeholder](https://via.placeholder.com/800x450.png?text=Dashboard+Overview) | ![Post Management Placeholder](https://via.placeholder.com/800x450.png?text=Post+Management) |
+| ![Dashboard Overview](docs/screenshots/dashboard.png) | ![Post Management](docs/screenshots/post_management.png) |
 
 *(Place your actual screenshots in a `docs/` folder and update these paths)*
 
