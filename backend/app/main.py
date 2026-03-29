@@ -34,6 +34,12 @@ while retry_count < max_retries:
         break
     except OperationalError:
         retry_count += 1
+        record_event(
+            "system",
+            "warning",
+            "Kết nối cơ sở dữ liệu thất bại khi khởi động, sẽ thử lại.",
+            details={"retry_count": retry_count, "max_retries": max_retries},
+        )
         if retry_count == max_retries:
             raise
         time.sleep(5)
@@ -83,4 +89,8 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "hoạt động bình thường"}
+    return {
+        "status": "healthy",
+        "app_role": settings.APP_ROLE,
+        "background_jobs_mode": settings.BACKGROUND_JOBS_MODE,
+    }

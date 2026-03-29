@@ -1,14 +1,16 @@
 x-logging: &default-logging
   driver: "json-file"
   options:
-    max-size: "10m"
-    max-file: "3"
+    max-size: "20m"
+    max-file: "5"
 
 services:
   db:
     image: postgres:15-alpine
     container_name: social_db
-    restart: always
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
     logging: *default-logging
     environment:
       POSTGRES_USER: admin
@@ -19,20 +21,23 @@ services:
     volumes:
       - ./database:/var/lib/postgresql/data
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U admin -d postgres" ]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U admin -d social_auto"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 6
+      start_period: 10s
 
   backend:
     build: ./backend
     container_name: social_backend
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 45s
     env_file:
       - ./backend/runtime.env
     dns:
       - 8.8.8.8
       - 1.1.1.1
-    restart: always
     logging: *default-logging
     ports:
       - "8000:8000"
@@ -55,23 +60,44 @@ services:
       - PASSWORD_MIN_LENGTH=8
       - SCHEDULER_INTERVAL_MINUTES=1
       - TASK_QUEUE_POLL_SECONDS=5
+      - TASK_RETRY_BASE_SECONDS=15
+      - TASK_RETRY_MAX_SECONDS=300
+      - TASK_LOCK_STALE_SECONDS=300
       - WORKER_STALE_SECONDS=30
       - WORKER_BATCH_SIZE=3
+      - EXTERNAL_HTTP_TIMEOUT=10
+      - HTTP_RETRY_ATTEMPTS=3
+      - HTTP_RETRY_BASE_SECONDS=2
+      - HTTP_RETRY_MAX_SECONDS=20
       - SCHEDULER_ENABLED=false
       - AUTO_CREATE_SCHEMA=false
       - BACKGROUND_JOBS_MODE=dedicated-worker
       - APP_ROLE=api
       - LOG_LEVEL=INFO
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   worker:
     build: ./backend
     container_name: social_worker
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
     env_file:
       - ./backend/runtime.env
     dns:
       - 8.8.8.8
       - 1.1.1.1
-    restart: always
     logging: *default-logging
     command: ["sh", "-c", "alembic upgrade head && python -m app.worker.run"]
     volumes:
@@ -93,29 +119,56 @@ services:
       - PASSWORD_MIN_LENGTH=8
       - SCHEDULER_INTERVAL_MINUTES=1
       - TASK_QUEUE_POLL_SECONDS=5
+      - TASK_RETRY_BASE_SECONDS=15
+      - TASK_RETRY_MAX_SECONDS=300
+      - TASK_LOCK_STALE_SECONDS=300
       - WORKER_STALE_SECONDS=30
       - WORKER_BATCH_SIZE=3
+      - EXTERNAL_HTTP_TIMEOUT=10
+      - HTTP_RETRY_ATTEMPTS=3
+      - HTTP_RETRY_BASE_SECONDS=2
+      - HTTP_RETRY_MAX_SECONDS=20
       - SCHEDULER_ENABLED=true
       - AUTO_CREATE_SCHEMA=false
       - BACKGROUND_JOBS_MODE=dedicated-worker
       - APP_ROLE=worker
       - LOG_LEVEL=INFO
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.worker.healthcheck"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
 
   frontend:
     build: ./frontend
     container_name: social_frontend
-    restart: always
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
     logging: *default-logging
     ports:
-      - "5173:5173"
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
+      - "5173:80"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "-q",
+          "--spider",
+          "http://127.0.0.1/",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: social_tunnel
-    restart: always
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 20s
     logging: *default-logging
     network_mode: "service:backend"
     env_file:
@@ -123,4 +176,4 @@ services:
     command: tunnel --no-autoupdate run
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy

@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
+import tempfile
+import uuid
 
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
-TEST_DB_PATH = Path(__file__).with_name("test_suite.db")
+TEST_DB_PATH = Path(tempfile.gettempdir()) / f"social_tool_test_suite_{uuid.uuid4().hex}.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH.as_posix()}"
 os.environ["JWT_SECRET"] = "test-jwt-secret"
 os.environ["TOKEN_ENCRYPTION_SECRET"] = "test-token-secret"
@@ -22,6 +24,24 @@ from app.api import auth, campaigns, facebook, system, users, webhooks
 from app.api.auth import require_authenticated_user
 from app.core.database import Base, SessionLocal, engine
 from app.services.accounts import ensure_default_admin
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup_test_db_file():
+    try:
+        if TEST_DB_PATH.exists():
+            TEST_DB_PATH.unlink()
+    except OSError:
+        pass
+
+    yield
+
+    engine.dispose()
+    try:
+        if TEST_DB_PATH.exists():
+            TEST_DB_PATH.unlink()
+    except OSError:
+        pass
 
 
 @pytest.fixture(autouse=True)

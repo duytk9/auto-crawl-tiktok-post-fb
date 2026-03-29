@@ -1,13 +1,20 @@
-FROM node:20-alpine
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
 COPY . .
+RUN npm run build
 
-# Đảm bảo quyền thực thi cho các file trong .bin
-RUN chmod -R +x node_modules/.bin
+FROM nginx:1.27-alpine AS runner
 
-CMD ["npx", "vite", "--host"]
+WORKDIR /usr/share/nginx/html
+
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/dist ./
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]

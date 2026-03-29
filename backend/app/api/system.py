@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import require_admin
 from app.core.config import DEFAULT_JWT_SECRET, DEFAULT_TOKEN_ENCRYPTION_SECRET, settings
 from app.core.database import get_db
+from app.core.time import utc_now
 from app.models.models import (
     Campaign,
     CampaignStatus,
@@ -24,14 +25,23 @@ from app.models.models import (
     WorkerHeartbeat,
 )
 from app.services.observability import record_event
+from app.services.health_checks import (
+    build_overall_health_status,
+    build_queue_health,
+    check_facebook_dependency,
+    check_gemini_dependency,
+    check_runtime_env_health,
+)
 from app.services.runtime_settings import (
+    RUNTIME_ENV_FILE,
     build_runtime_settings_payload,
     get_runtime_setting_specs,
     resolve_runtime_value,
     update_runtime_settings,
 )
 from app.services.security import is_default_secret
-from app.services.task_queue import serialize_task, summarize_tasks
+from app.services.task_queue import count_stale_processing_tasks, serialize_task, summarize_tasks
+from app.services.ytdlp_crawler import get_downloader_health
 
 router = APIRouter(prefix="/system", tags=["Hệ thống"])
 
@@ -45,7 +55,7 @@ class RuntimeSettingsUpdateRequest(BaseModel):
 
 
 def serialize_worker(worker: WorkerHeartbeat) -> dict:
-    now = datetime.utcnow()
+    now = utc_now()
     age_seconds = int((now - worker.last_seen_at).total_seconds()) if worker.last_seen_at else None
     is_online = bool(age_seconds is not None and age_seconds <= settings.WORKER_STALE_SECONDS)
     return {
@@ -82,7 +92,7 @@ def get_system_overview(db: Session = Depends(get_db)):
     fb_app_secret = resolve_runtime_value("FB_APP_SECRET", db=db)
     tunnel_token = resolve_runtime_value("TUNNEL_TOKEN", db=db)
     warnings = []
-    worker_cutoff = datetime.utcnow() - timedelta(seconds=settings.WORKER_STALE_SECONDS)
+    worker_cutoff = utc_now() - timedelta(seconds=settings.WORKER_STALE_SECONDS)
 
     if not webhook_url or not webhook_url.startswith("https://"):
         warnings.append("BASE_URL chưa là HTTPS công khai. Facebook webhook sẽ không hoạt động ổn định.")
@@ -101,15 +111,18 @@ def get_system_overview(db: Session = Depends(get_db)):
     must_change_password = db.query(User).filter(User.must_change_password.is_(True)).count()
     pending_comment_replies = db.query(InteractionLog).filter(InteractionLog.status == InteractionStatus.pending).count()
     pending_message_replies = db.query(InboxMessageLog).filter(InboxMessageLog.status == InteractionStatus.pending).count()
+    stale_processing_tasks = count_stale_processing_tasks(db)
 
     if must_change_password:
         warnings.append("Có tài khoản đang bị yêu cầu đổi mật khẩu.")
     if queue_summary.get(TaskStatus.failed.value, 0):
         warnings.append("Có tác vụ nền đã thất bại và cần kiểm tra.")
+    if stale_processing_tasks:
+        warnings.append("Có tác vụ nền bị kẹt và đang chờ worker khôi phục.")
 
     return {
         "project_name": settings.PROJECT_NAME,
-        "server_time": datetime.utcnow().isoformat(),
+        "server_time": utc_now().isoformat(),
         "app_role": settings.APP_ROLE,
         "base_url": base_url,
         "webhook_url": webhook_url,
@@ -132,6 +145,7 @@ def get_system_overview(db: Session = Depends(get_db)):
         "online_workers": online_workers,
         "must_change_password_users": must_change_password,
         "task_queue": queue_summary,
+        "stale_processing_tasks": stale_processing_tasks,
         "warnings": warnings,
     }
 
@@ -150,23 +164,44 @@ def get_system_health(db: Session = Depends(get_db)):
     tunnel_token = resolve_runtime_value("TUNNEL_TOKEN", db=db)
     fb_app_secret = resolve_runtime_value("FB_APP_SECRET", db=db)
     workers = [serialize_worker(worker) for worker in db.query(WorkerHeartbeat).order_by(WorkerHeartbeat.last_seen_at.desc()).all()]
-    queue_summary = summarize_tasks(db)
+    queue_health = build_queue_health(db)
+    downloader_health = get_downloader_health()
+    runtime_env_health = check_runtime_env_health()
+    facebook_health = check_facebook_dependency(db)
+    gemini_health = check_gemini_dependency(db)
+    overall_status = build_overall_health_status(
+        database_ok=db_ok,
+        downloader_ok=downloader_health["ok"],
+        runtime_env_ok=runtime_env_health["ok"],
+        queue_health=queue_health,
+        facebook_health=facebook_health,
+        gemini_health=gemini_health,
+    )
 
     return {
-        "checked_at": datetime.utcnow().isoformat(),
+        "status": overall_status,
+        "checked_at": utc_now().isoformat(),
         "database": {"ok": db_ok, "error": db_error},
         "worker": {
             "expected_mode": settings.BACKGROUND_JOBS_MODE,
             "online_count": sum(1 for worker in workers if worker["is_online"]),
             "workers": workers,
         },
-        "queue": queue_summary,
+        "queue": queue_health,
         "config": {
             "public_webhook_ready": bool(base_url.startswith("https://")),
             "webhook_signature_enabled": bool(fb_app_secret),
             "tunnel_token_configured": bool(tunnel_token),
             "scheduler_enabled": settings.SCHEDULER_ENABLED,
             "task_queue_poll_seconds": settings.TASK_QUEUE_POLL_SECONDS,
+            "task_lock_stale_seconds": settings.TASK_LOCK_STALE_SECONDS,
+            "runtime_env_file": str(RUNTIME_ENV_FILE),
+        },
+        "dependencies": {
+            "facebook_graph": facebook_health,
+            "gemini": gemini_health,
+            "yt_dlp": downloader_health,
+            "runtime_env": runtime_env_health,
         },
     }
 
@@ -242,7 +277,7 @@ def cleanup_stale_workers(
     current_user: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    stale_cutoff = datetime.utcnow() - timedelta(seconds=settings.WORKER_STALE_SECONDS)
+    stale_cutoff = utc_now() - timedelta(seconds=settings.WORKER_STALE_SECONDS)
     stale_workers = db.query(WorkerHeartbeat).filter(WorkerHeartbeat.last_seen_at < stale_cutoff).all()
     stale_names = [worker.worker_name for worker in stale_workers]
 

@@ -1,23 +1,47 @@
 import json
+import uuid
 from datetime import datetime, timedelta
 from json import JSONDecodeError
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_authenticated_user
+from app.api.auth import require_admin, require_authenticated_user
 from app.core.config import settings
 from app.core.database import get_db
-from app.models.models import FacebookPage, InboxMessageLog, InteractionLog, InteractionStatus, User
+from app.core.time import utc_now
+from app.models.models import ConversationStatus, FacebookPage, InboxConversation, InboxMessageLog, InteractionLog, InteractionStatus, User
+from app.services.accounts import serialize_user
+from app.services.inbox_memory import get_or_create_inbox_conversation, serialize_conversation, touch_conversation_with_customer_message
 from app.services.observability import record_event
 from app.services.runtime_settings import resolve_runtime_value
 from app.services.security import verify_facebook_signature
 from app.services.task_queue import TASK_TYPE_COMMENT_REPLY, TASK_TYPE_MESSAGE_REPLY, enqueue_task
+from app.services.fb_graph import send_page_message
+from app.services.security import decrypt_secret
 
 router = APIRouter(prefix="/webhooks", tags=["Webhook"])
 LOCAL_TIMEZONE = ZoneInfo(settings.APP_TIMEZONE)
+
+
+class ConversationHandoffUpdate(BaseModel):
+    needs_human_handoff: bool
+    handoff_reason: str | None = None
+
+
+class ConversationUpdateRequest(BaseModel):
+    status: ConversationStatus | None = None
+    assigned_to_user_id: str | None = None
+    internal_note: str | None = Field(default=None, max_length=1000)
+    handoff_reason: str | None = Field(default=None, max_length=300)
+
+
+class ConversationReplyRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    mark_resolved: bool = False
 
 
 def serialize_interaction_log(log: InteractionLog) -> dict:
@@ -35,25 +59,187 @@ def serialize_interaction_log(log: InteractionLog) -> dict:
     }
 
 
-def serialize_message_log(log: InboxMessageLog) -> dict:
+def _serialize_compact_user(user: User | None) -> dict | None:
+    if not user:
+        return None
+    payload = serialize_user(user)
+    return {
+        "id": payload["id"],
+        "username": payload["username"],
+        "display_name": payload["display_name"] or payload["username"],
+        "role": payload["role"],
+    }
+
+
+def _resolve_conversation_activity_time(conversation: InboxConversation) -> datetime | None:
+    candidates = [
+        conversation.last_customer_message_at,
+        conversation.last_ai_reply_at,
+        conversation.last_operator_reply_at,
+        conversation.updated_at,
+        conversation.created_at,
+    ]
+    values = [item for item in candidates if item is not None]
+    return max(values) if values else None
+
+
+def _resolve_conversation_preview(log: InboxMessageLog | None) -> tuple[str, str]:
+    if not log:
+        return "empty", "Chưa có nội dung."
+    if (log.user_message or "").strip():
+        return "customer", log.user_message.strip()
+    if (log.ai_reply or "").strip():
+        return "page", log.ai_reply.strip()
+    return "empty", "Chưa có nội dung."
+
+
+def serialize_message_log(
+    log: InboxMessageLog,
+    conversation: InboxConversation | None = None,
+    reply_author: User | None = None,
+) -> dict:
     return {
         "id": str(log.id),
         "page_id": log.page_id,
+        "conversation_id": str(log.conversation_id) if log.conversation_id else None,
         "facebook_message_id": log.facebook_message_id,
         "sender_id": log.sender_id,
         "recipient_id": log.recipient_id,
         "user_message": log.user_message,
         "ai_reply": log.ai_reply,
         "facebook_reply_message_id": log.facebook_reply_message_id,
+        "reply_source": log.reply_source or ("ai" if log.ai_reply and log.status == InteractionStatus.replied else ""),
+        "reply_author_user_id": str(log.reply_author_user_id) if log.reply_author_user_id else None,
+        "reply_author": _serialize_compact_user(reply_author),
         "last_error": log.last_error,
         "status": log.status.value if hasattr(log.status, "value") else log.status,
         "created_at": log.created_at.isoformat() if log.created_at else None,
         "updated_at": log.updated_at.isoformat() if log.updated_at else None,
+        "conversation": serialize_conversation(conversation),
     }
+
+
+def serialize_conversation_item(
+    conversation: InboxConversation,
+    *,
+    latest_log: InboxMessageLog | None,
+    assigned_user: User | None = None,
+    message_count: int = 0,
+) -> dict:
+    preview_direction, preview_text = _resolve_conversation_preview(latest_log)
+    payload = serialize_conversation(conversation, assigned_user=assigned_user) or {}
+    payload.update(
+        {
+            "message_count": message_count,
+            "latest_activity_at": _resolve_conversation_activity_time(conversation).isoformat()
+            if _resolve_conversation_activity_time(conversation)
+            else None,
+            "latest_preview": preview_text,
+            "latest_preview_direction": preview_direction,
+            "latest_log": serialize_message_log(latest_log, conversation, reply_author=assigned_user) if latest_log else None,
+        }
+    )
+    return payload
 
 
 def get_local_now() -> datetime:
     return datetime.now(LOCAL_TIMEZONE)
+
+
+def _load_user_map(db: Session, user_ids: list[uuid.UUID | str | None]) -> dict[uuid.UUID, User]:
+    normalized_ids = []
+    for raw_user_id in user_ids:
+        if not raw_user_id:
+            continue
+        if isinstance(raw_user_id, uuid.UUID):
+            normalized_ids.append(raw_user_id)
+            continue
+        try:
+            normalized_ids.append(uuid.UUID(str(raw_user_id)))
+        except ValueError:
+            continue
+    if not normalized_ids:
+        return {}
+    users = db.query(User).filter(User.id.in_(normalized_ids)).all()
+    return {user.id: user for user in users}
+
+
+def _get_conversation_rows(
+    db: Session,
+    *,
+    status: str = "all",
+    limit: int = 100,
+) -> list[dict]:
+    query = db.query(InboxConversation)
+    if status != "all":
+        query = query.filter(InboxConversation.status == ConversationStatus(status))
+    conversations = query.all()
+    if not conversations:
+        return []
+
+    conversation_ids = [conversation.id for conversation in conversations]
+    logs = (
+        db.query(InboxMessageLog)
+        .filter(InboxMessageLog.conversation_id.in_(conversation_ids))
+        .order_by(InboxMessageLog.created_at.desc())
+        .all()
+    )
+
+    latest_log_map: dict[uuid.UUID, InboxMessageLog] = {}
+    message_counts: dict[uuid.UUID, int] = {}
+    reply_author_ids: list[uuid.UUID] = []
+    for log in logs:
+        if not log.conversation_id:
+            continue
+        message_counts[log.conversation_id] = message_counts.get(log.conversation_id, 0) + 1
+        if log.reply_author_user_id:
+            reply_author_ids.append(log.reply_author_user_id)
+        if log.conversation_id not in latest_log_map:
+            latest_log_map[log.conversation_id] = log
+
+    assigned_user_map = _load_user_map(db, [conversation.assigned_to_user_id for conversation in conversations] + reply_author_ids)
+    ordered = sorted(
+        conversations,
+        key=lambda conversation: _resolve_conversation_activity_time(conversation) or conversation.created_at or utc_now(),
+        reverse=True,
+    )[:limit]
+
+    items = []
+    for conversation in ordered:
+        latest_log = latest_log_map.get(conversation.id)
+        item = serialize_conversation_item(
+            conversation,
+            latest_log=latest_log,
+            assigned_user=assigned_user_map.get(conversation.assigned_to_user_id),
+            message_count=message_counts.get(conversation.id, 0),
+        )
+        if latest_log and item.get("latest_log"):
+            item["latest_log"]["reply_author"] = _serialize_compact_user(
+                assigned_user_map.get(latest_log.reply_author_user_id),
+            ) if latest_log.reply_author_user_id else None
+        items.append(item)
+    return items
+
+
+def _set_conversation_status(
+    conversation: InboxConversation,
+    *,
+    status: ConversationStatus,
+    handoff_reason: str | None = None,
+) -> None:
+    conversation.status = status
+    if status == ConversationStatus.operator_active:
+        conversation.needs_human_handoff = True
+        conversation.handoff_reason = (handoff_reason or conversation.handoff_reason or "Đã chuyển cho nhân viên hỗ trợ.").strip()[:300]
+        conversation.resolved_at = None
+    elif status == ConversationStatus.resolved:
+        conversation.needs_human_handoff = False
+        conversation.handoff_reason = None
+        conversation.resolved_at = utc_now()
+    else:
+        conversation.needs_human_handoff = False
+        conversation.handoff_reason = None
+        conversation.resolved_at = None
 
 
 def _parse_hhmm(raw_value: str | None):
@@ -113,7 +299,7 @@ def _get_message_cooldown_reason(db: Session, page_id: str, sender_id: str, cool
     if not latest_time:
         return None
 
-    if latest_time >= datetime.utcnow() - timedelta(minutes=cooldown_minutes):
+    if latest_time >= utc_now() - timedelta(minutes=cooldown_minutes):
         return f"Đang trong thời gian chờ {cooldown_minutes} phút cho người gửi này."
 
     return None
@@ -212,6 +398,18 @@ def _record_message_event(db: Session, page_id: str, event: dict):
         )
         return
 
+    conversation = get_or_create_inbox_conversation(
+        db,
+        page_id=page_id,
+        sender_id=sender_id,
+        recipient_id=recipient_id,
+    )
+    touch_conversation_with_customer_message(
+        conversation,
+        message_id=message_id,
+        recipient_id=recipient_id,
+    )
+
     local_now = get_local_now()
     schedule_allowed, schedule_reason = _is_within_message_schedule(page_config, local_now)
     cooldown_reason = _get_message_cooldown_reason(
@@ -220,10 +418,24 @@ def _record_message_event(db: Session, page_id: str, event: dict):
         sender_id=sender_id,
         cooldown_minutes=page_config.message_reply_cooldown_minutes or 0,
     )
-    should_auto_reply = bool(page_config.message_auto_reply_enabled and schedule_allowed and not cooldown_reason)
+    handoff_reason = (
+        "Cuộc trò chuyện này đang được chuyển cho nhân viên hỗ trợ."
+        if conversation.status == ConversationStatus.operator_active or conversation.needs_human_handoff
+        else None
+    )
+    should_auto_reply = bool(
+        conversation.status == ConversationStatus.ai_active
+        and not conversation.needs_human_handoff
+        and page_config.message_auto_reply_enabled
+        and schedule_allowed
+        and not cooldown_reason
+        and not handoff_reason
+    )
     ignored_reason = None
     if not page_config.message_auto_reply_enabled:
         ignored_reason = "Tự động phản hồi inbox đang tắt cho fanpage này."
+    elif handoff_reason:
+        ignored_reason = handoff_reason
     elif not schedule_allowed:
         ignored_reason = schedule_reason
     elif cooldown_reason:
@@ -231,6 +443,7 @@ def _record_message_event(db: Session, page_id: str, event: dict):
 
     log = InboxMessageLog(
         page_id=page_id,
+        conversation_id=conversation.id,
         facebook_message_id=message_id,
         sender_id=sender_id,
         recipient_id=recipient_id,
@@ -340,4 +553,284 @@ def get_message_logs(
     _: User = Depends(require_authenticated_user),
 ):
     logs = db.query(InboxMessageLog).order_by(InboxMessageLog.created_at.desc()).limit(50).all()
-    return [serialize_message_log(log) for log in logs]
+    conversation_ids = [log.conversation_id for log in logs if log.conversation_id]
+    conversations = {}
+    if conversation_ids:
+        rows = db.query(InboxConversation).filter(InboxConversation.id.in_(conversation_ids)).all()
+        conversations = {row.id: row for row in rows}
+    reply_user_map = _load_user_map(db, [log.reply_author_user_id for log in logs])
+    return [
+        serialize_message_log(
+            log,
+            conversations.get(log.conversation_id),
+            reply_author=reply_user_map.get(log.reply_author_user_id),
+        )
+        for log in logs
+    ]
+
+
+@router.get("/conversations")
+def get_message_conversations(
+    status: str = Query(default="all"),
+    limit: int = Query(default=60, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_authenticated_user),
+):
+    if status != "all":
+        try:
+            ConversationStatus(status)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Trạng thái conversation không hợp lệ.") from exc
+    return {"conversations": _get_conversation_rows(db, status=status, limit=limit)}
+
+
+@router.get("/conversations/{conversation_id}")
+def get_message_conversation_detail(
+    conversation_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_authenticated_user),
+):
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Mã conversation không hợp lệ.") from exc
+
+    conversation = db.query(InboxConversation).filter(InboxConversation.id == conversation_uuid).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Không tìm thấy cuộc trò chuyện.")
+
+    logs = (
+        db.query(InboxMessageLog)
+        .filter(InboxMessageLog.conversation_id == conversation_uuid)
+        .order_by(InboxMessageLog.created_at.asc())
+        .all()
+    )
+    reply_user_map = _load_user_map(
+        db,
+        [conversation.assigned_to_user_id] + [log.reply_author_user_id for log in logs],
+    )
+    latest_log = logs[-1] if logs else None
+    return {
+        "conversation": serialize_conversation_item(
+            conversation,
+            latest_log=latest_log,
+            assigned_user=reply_user_map.get(conversation.assigned_to_user_id),
+            message_count=len(logs),
+        ),
+        "logs": [
+            serialize_message_log(
+                log,
+                conversation,
+                reply_author=reply_user_map.get(log.reply_author_user_id),
+            )
+            for log in logs
+        ],
+    }
+
+
+@router.patch("/conversations/{conversation_id}")
+def update_message_conversation(
+    conversation_id: str,
+    payload: ConversationUpdateRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_authenticated_user),
+):
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Mã conversation không hợp lệ.") from exc
+
+    conversation = db.query(InboxConversation).filter(InboxConversation.id == conversation_uuid).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Không tìm thấy cuộc trò chuyện cần cập nhật.")
+
+    if payload.assigned_to_user_id is not None:
+        assigned_user_id = payload.assigned_to_user_id.strip()
+        if assigned_user_id:
+            try:
+                assigned_uuid = uuid.UUID(assigned_user_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Mã người xử lý không hợp lệ.") from exc
+            assigned_user = db.query(User).filter(User.id == assigned_uuid, User.is_active.is_(True)).first()
+            if not assigned_user:
+                raise HTTPException(status_code=404, detail="Không tìm thấy nhân viên để gán xử lý.")
+            if current_user.role.value != "admin" and assigned_user.id != current_user.id:
+                raise HTTPException(status_code=403, detail="Bạn chỉ có thể nhận cuộc chat về cho chính mình.")
+            conversation.assigned_to_user_id = assigned_user.id
+        else:
+            conversation.assigned_to_user_id = None
+
+    if payload.internal_note is not None:
+        conversation.internal_note = (payload.internal_note or "").strip()[:1000] or None
+
+    if payload.status is not None:
+        _set_conversation_status(
+            conversation,
+            status=payload.status,
+            handoff_reason=payload.handoff_reason,
+        )
+        if payload.status == ConversationStatus.ai_active and current_user.role.value != "admin":
+            conversation.assigned_to_user_id = current_user.id
+    elif payload.handoff_reason is not None and conversation.status == ConversationStatus.operator_active:
+        conversation.handoff_reason = (payload.handoff_reason or "").strip()[:300] or None
+
+    db.commit()
+    db.refresh(conversation)
+    assigned_user_map = _load_user_map(db, [conversation.assigned_to_user_id])
+
+    record_event(
+        "webhook",
+        "info",
+        "Đã cập nhật thông tin vận hành của cuộc trò chuyện inbox.",
+        db=db,
+        actor_user_id=str(current_user.id),
+        details={
+            "conversation_id": str(conversation.id),
+            "page_id": conversation.page_id,
+            "sender_id": conversation.sender_id,
+            "status": conversation.status.value if hasattr(conversation.status, "value") else conversation.status,
+            "assigned_to_user_id": str(conversation.assigned_to_user_id) if conversation.assigned_to_user_id else None,
+        },
+    )
+
+    return {
+        "message": "Đã cập nhật cuộc trò chuyện.",
+        "conversation": serialize_conversation(
+            conversation,
+            assigned_user=assigned_user_map.get(conversation.assigned_to_user_id),
+        ),
+    }
+
+
+@router.post("/conversations/{conversation_id}/reply")
+def send_manual_message_reply(
+    conversation_id: str,
+    payload: ConversationReplyRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_authenticated_user),
+):
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Mã conversation không hợp lệ.") from exc
+
+    conversation = db.query(InboxConversation).filter(InboxConversation.id == conversation_uuid).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Không tìm thấy cuộc trò chuyện.")
+
+    page_config = db.query(FacebookPage).filter(FacebookPage.page_id == conversation.page_id).first()
+    if not page_config or not page_config.long_lived_access_token:
+        raise HTTPException(status_code=400, detail="Trang Facebook chưa có Page Access Token hợp lệ.")
+
+    access_token = decrypt_secret(page_config.long_lived_access_token)
+    message_text = payload.message.strip()
+    if not message_text:
+        raise HTTPException(status_code=400, detail="Nội dung phản hồi không được để trống.")
+
+    response = send_page_message(conversation.sender_id, message_text, access_token)
+    if not response or response.get("error"):
+        raise HTTPException(status_code=502, detail=response.get("error") if isinstance(response, dict) else "Không thể gửi phản hồi qua Facebook.")
+
+    reply_message_id = response.get("message_id") or response.get("id") or f"manual:{uuid.uuid4()}"
+    log = InboxMessageLog(
+        page_id=conversation.page_id,
+        conversation_id=conversation.id,
+        facebook_message_id=f"outbound:{reply_message_id}",
+        sender_id=conversation.sender_id,
+        recipient_id=conversation.recipient_id or conversation.page_id,
+        user_message=None,
+        ai_reply=message_text,
+        facebook_reply_message_id=reply_message_id,
+        reply_source="operator",
+        reply_author_user_id=current_user.id,
+        status=InteractionStatus.replied,
+        last_error=None,
+    )
+    db.add(log)
+    conversation.latest_reply_message_id = reply_message_id
+    conversation.last_operator_reply_at = utc_now()
+    conversation.assigned_to_user_id = current_user.id
+    if payload.mark_resolved:
+        _set_conversation_status(conversation, status=ConversationStatus.resolved)
+    else:
+        _set_conversation_status(
+            conversation,
+            status=ConversationStatus.operator_active,
+            handoff_reason=conversation.handoff_reason or "Operator đang tiếp nhận cuộc trò chuyện này.",
+        )
+    db.commit()
+    db.refresh(log)
+    db.refresh(conversation)
+
+    assigned_user_map = _load_user_map(db, [conversation.assigned_to_user_id, current_user.id])
+    record_event(
+        "webhook",
+        "info",
+        "Operator đã phản hồi thủ công một cuộc trò chuyện inbox.",
+        db=db,
+        actor_user_id=str(current_user.id),
+        details={
+            "conversation_id": str(conversation.id),
+            "page_id": conversation.page_id,
+            "sender_id": conversation.sender_id,
+            "status": conversation.status.value if hasattr(conversation.status, "value") else conversation.status,
+        },
+    )
+
+    return {
+        "message": "Đã gửi phản hồi thủ công thành công.",
+        "conversation": serialize_conversation(
+            conversation,
+            assigned_user=assigned_user_map.get(conversation.assigned_to_user_id),
+        ),
+        "log": serialize_message_log(log, conversation, reply_author=assigned_user_map.get(current_user.id)),
+    }
+
+
+@router.patch("/messages/{conversation_id}/handoff")
+def update_message_conversation_handoff(
+    conversation_id: str,
+    payload: ConversationHandoffUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_authenticated_user),
+):
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Mã conversation không hợp lệ.") from exc
+
+    conversation = db.query(InboxConversation).filter(InboxConversation.id == conversation_uuid).first()
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Không tìm thấy cuộc trò chuyện cần cập nhật.")
+
+    _set_conversation_status(
+        conversation,
+        status=ConversationStatus.operator_active if payload.needs_human_handoff else ConversationStatus.resolved,
+        handoff_reason=payload.handoff_reason,
+    )
+    conversation.assigned_to_user_id = current_user.id if payload.needs_human_handoff else conversation.assigned_to_user_id
+    db.commit()
+    db.refresh(conversation)
+    assigned_user_map = _load_user_map(db, [conversation.assigned_to_user_id])
+
+    record_event(
+        "webhook",
+        "info",
+        "Đã cập nhật trạng thái handoff của cuộc trò chuyện inbox.",
+        db=db,
+        actor_user_id=str(current_user.id),
+        details={
+            "conversation_id": str(conversation.id),
+            "page_id": conversation.page_id,
+            "sender_id": conversation.sender_id,
+            "needs_human_handoff": conversation.needs_human_handoff,
+        },
+    )
+
+    return {
+        "message": "Đã cập nhật trạng thái cuộc trò chuyện.",
+        "conversation": serialize_conversation(
+            conversation,
+            assigned_user=assigned_user_map.get(conversation.assigned_to_user_id),
+        ),
+    }

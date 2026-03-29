@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.time import utc_now
 from app.models.models import Campaign, CampaignStatus, FacebookPage, Video, VideoStatus
 from app.services.ai_generator import generate_caption
 from app.services.fb_graph import upload_video_to_facebook
@@ -23,7 +24,7 @@ def auto_post_job():
     db: Session = SessionLocal()
     update_worker_heartbeat(WORKER_NAME, app_role=settings.APP_ROLE, status="quét lịch đăng", db=db)
     try:
-        now = datetime.utcnow()
+        now = utc_now()
         pages = db.query(FacebookPage).all()
 
         for page in pages:

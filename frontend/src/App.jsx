@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -57,6 +57,19 @@ const DEFAULT_STATS = {
   next_publish: null,
   queue_end: null,
   last_posted: null,
+  by_source: {
+    tiktok: { campaigns: 0, videos: 0, ready: 0 },
+    youtube: { campaigns: 0, videos: 0, ready: 0 },
+    unknown: { campaigns: 0, videos: 0, ready: 0 },
+  },
+  source_trends: {
+    labels: [],
+    series: {
+      tiktok: { ready: [], posted: [], failed: [] },
+      youtube: { ready: [], posted: [], failed: [] },
+      unknown: { ready: [], posted: [], failed: [] },
+    },
+  },
 };
 
 const DEFAULT_TASK_SUMMARY = { queued: 0, processing: 0, completed: 0, failed: 0 };
@@ -97,6 +110,12 @@ const STATUS_FILTERS = [
   { value: 'ready', label: 'Sẵn sàng đăng' },
   { value: 'posted', label: 'Đã đăng' },
   { value: 'failed', label: 'Thất bại' },
+];
+
+const SOURCE_PLATFORM_FILTERS = [
+  { value: 'all', label: 'Tất cả nguồn' },
+  { value: 'tiktok', label: 'TikTok' },
+  { value: 'youtube', label: 'YouTube Shorts' },
 ];
 
 const NAV_ITEMS = [
@@ -149,6 +168,33 @@ const PAGE_TOKEN_META = {
   missing: { label: 'Chưa có token', tone: 'slate' },
 };
 
+const CONVERSATION_STATUS_META = {
+  ai_active: { label: 'AI đang xử lý', tone: 'sky' },
+  operator_active: { label: 'Cần operator', tone: 'rose' },
+  resolved: { label: 'Đã xử lý', tone: 'emerald' },
+};
+
+const SOURCE_PLATFORM_META = {
+  tiktok: { label: 'TikTok', tone: 'sky' },
+  youtube: { label: 'YouTube Shorts', tone: 'rose' },
+  unknown: { label: 'Chưa rõ nguồn', tone: 'slate' },
+};
+
+const SOURCE_KIND_LABELS = {
+  tiktok_video: 'Video TikTok',
+  tiktok_profile: 'Hồ sơ TikTok',
+  tiktok_shortlink: 'Link TikTok rút gọn',
+  tiktok_legacy: 'Nguồn TikTok cũ',
+  youtube_short: 'YouTube Short',
+  youtube_shorts_feed: 'Nguồn Shorts YouTube',
+};
+
+const TREND_STATUS_META = {
+  ready: { label: 'Sẵn sàng', color: '#67e8f9', textClass: 'text-cyan-100' },
+  posted: { label: 'Đã đăng', color: '#34d399', textClass: 'text-emerald-100' },
+  failed: { label: 'Thất bại', color: '#fb7185', textClass: 'text-rose-100' },
+};
+
 function cx(...values) {
   return values.filter(Boolean).join(' ');
 }
@@ -185,6 +231,12 @@ function formatRelTime(isoString) {
   const diffHours = Math.floor(diffMinutes / 60);
   if (diffHours < 24) return `${diffHours} giờ nữa`;
   return `${Math.floor(diffHours / 24)} ngày nữa`;
+}
+
+function formatTrendLabel(dateString) {
+  if (!dateString) return '--';
+  const [, month, day] = dateString.split('-');
+  return `${day}/${month}`;
 }
 
 function getStatusClasses(status) {
@@ -226,6 +278,178 @@ function getStatusLabel(status) {
 
 function getPageTokenMeta(tokenKind) {
   return PAGE_TOKEN_META[tokenKind] || PAGE_TOKEN_META.missing;
+}
+
+function getSourcePlatformMeta(sourcePlatform) {
+  return SOURCE_PLATFORM_META[sourcePlatform] || SOURCE_PLATFORM_META.unknown;
+}
+
+function getSourceKindLabel(sourceKind) {
+  return SOURCE_KIND_LABELS[sourceKind] || sourceKind || 'Chưa rõ kiểu nguồn';
+}
+
+function summarizeSourceCounts(items, selector) {
+  return items.reduce(
+    (summary, item) => {
+      const rawValue = selector(item);
+      const key = rawValue === 'tiktok' || rawValue === 'youtube' ? rawValue : 'unknown';
+      summary[key] += 1;
+      return summary;
+    },
+    { tiktok: 0, youtube: 0, unknown: 0 },
+  );
+}
+
+function formatIntentLabel(intent) {
+  const normalized = (intent || '').trim();
+  if (!normalized) return 'Chưa xác định';
+  return normalized.replace(/_/g, ' ');
+}
+
+function getConversationFactEntries(conversation) {
+  if (!conversation?.customer_facts || typeof conversation.customer_facts !== 'object') return [];
+  return Object.entries(conversation.customer_facts).filter(([key, value]) => key && value);
+}
+
+function getConversationStatusMeta(status) {
+  return CONVERSATION_STATUS_META[status] || { label: 'Chưa rõ trạng thái', tone: 'slate' };
+}
+
+function buildConversationTimeline(logs) {
+  const events = [];
+  logs.forEach((log) => {
+    const customerText = (log.user_message || '').trim();
+    if (customerText) {
+      events.push({
+        id: `${log.id}-customer`,
+        type: 'customer',
+        text: customerText,
+        time: log.created_at,
+        sourceLabel: 'Khách hàng',
+        status: log.status,
+      });
+    }
+
+    const replyText = (log.ai_reply || '').trim();
+    const shouldShowReply = replyText && (log.status === 'replied' || log.facebook_reply_message_id || log.reply_source);
+    if (shouldShowReply) {
+      const isOperator = log.reply_source === 'operator';
+      events.push({
+        id: `${log.id}-reply`,
+        type: isOperator ? 'operator' : 'ai',
+        text: replyText,
+        time: log.updated_at || log.created_at,
+        sourceLabel: isOperator ? (log.reply_author?.display_name || 'Operator') : 'AI fanpage',
+        status: log.status,
+      });
+    }
+  });
+
+  return events.sort((left, right) => new Date(left.time || 0).getTime() - new Date(right.time || 0).getTime());
+}
+
+function detectSourcePreview(rawUrl) {
+  const candidate = (rawUrl || '').trim();
+  if (!candidate) {
+    return {
+      status: 'idle',
+      tone: 'slate',
+      title: 'Chưa nhập nguồn',
+      detail: 'Hỗ trợ TikTok và YouTube Shorts.',
+    };
+  }
+
+  let normalized = candidate;
+  if (!normalized.includes('://') && !normalized.startsWith('//')) {
+    normalized = `https://${normalized}`;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.replace(/\/+$/, '') || '/';
+
+    if (host.endsWith('tiktok.com')) {
+      if (host === 'vm.tiktok.com' || host === 'vt.tiktok.com' || path.toLowerCase().startsWith('/t/')) {
+        return {
+          status: 'ok',
+          tone: 'sky',
+          title: 'TikTok shortlink',
+          detail: 'Hệ thống sẽ mở shortlink và đồng bộ video từ đó.',
+        };
+      }
+      if (/^\/@[^/]+\/(video|photo)\/[^/]+$/i.test(path)) {
+        return {
+          status: 'ok',
+          tone: 'sky',
+          title: 'Video TikTok đơn lẻ',
+          detail: 'Phù hợp khi bạn muốn lấy đúng một video cụ thể.',
+        };
+      }
+      if (/^\/@[^/]+$/i.test(path)) {
+        return {
+          status: 'ok',
+          tone: 'sky',
+          title: 'Hồ sơ TikTok',
+          detail: 'Worker sẽ lấy danh sách video từ hồ sơ này.',
+        };
+      }
+      return {
+        status: 'warning',
+        tone: 'amber',
+        title: 'TikTok chưa đúng mẫu hỗ trợ',
+        detail: 'Hãy dùng link video, hồ sơ hoặc shortlink TikTok hợp lệ.',
+      };
+    }
+
+    if (['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(host)) {
+      if (/^\/shorts\/[^/]+$/i.test(path)) {
+        return {
+          status: 'ok',
+          tone: 'rose',
+          title: 'YouTube Short đơn lẻ',
+          detail: 'Phù hợp khi bạn muốn lấy đúng một short cụ thể.',
+        };
+      }
+      if (/^\/(?:@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)\/shorts$/i.test(path)) {
+        return {
+          status: 'ok',
+          tone: 'rose',
+          title: 'Nguồn YouTube Shorts',
+          detail: 'Worker sẽ chỉ lấy các Shorts hợp lệ từ nguồn này.',
+        };
+      }
+      return {
+        status: 'warning',
+        tone: 'amber',
+        title: 'Link YouTube chưa đúng scope',
+        detail: 'Chỉ hỗ trợ /shorts/... hoặc nguồn /@handle/shorts.',
+      };
+    }
+
+    if (['youtu.be', 'www.youtu.be'].includes(host)) {
+      return {
+        status: 'warning',
+        tone: 'amber',
+        title: 'Link rút gọn YouTube chưa hỗ trợ',
+        detail: 'Hãy dùng URL đầy đủ dạng youtube.com/shorts/...',
+      };
+    }
+
+    return {
+      status: 'warning',
+      tone: 'amber',
+      title: 'Nguồn chưa được hỗ trợ',
+      detail: 'Hiện chỉ hỗ trợ TikTok và YouTube Shorts.',
+    };
+  } catch {
+    return {
+      status: 'warning',
+      tone: 'amber',
+      title: 'Link nguồn chưa hợp lệ',
+      detail: 'Kiểm tra lại URL trước khi tạo chiến dịch.',
+    };
+  }
 }
 
 function getResolvedPageTokenKind(pageItem, validation) {
@@ -350,6 +574,97 @@ function InfoRow({ label, value, emphasis = false }) {
   );
 }
 
+function SourceBreakdownBar({ label, value, max = 1, tone = 'slate', detail }) {
+  const width = `${Math.max(8, Math.round((value / Math.max(1, max)) * 100))}%`;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[12px] text-[var(--text-muted)]">{label}</span>
+        <span className="text-sm font-medium text-white">{value}</span>
+      </div>
+      <div className="h-2.5 overflow-hidden rounded-full bg-white/8">
+        <div className={cx('h-full rounded-full', tone === 'rose' ? 'bg-rose-300/80' : tone === 'sky' ? 'bg-cyan-300/80' : 'bg-white/60')} style={{ width }} />
+      </div>
+      {detail ? <div className="text-[11px] text-[var(--text-muted)]">{detail}</div> : null}
+    </div>
+  );
+}
+
+function TrendLegend() {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {Object.entries(TREND_STATUS_META).map(([key, meta]) => (
+        <span key={key} className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[10px] text-[var(--text-soft)]">
+          <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: meta.color }} />
+          {meta.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function TrendTimelineChart({ labels, series }) {
+  const width = 100;
+  const height = 56;
+  const entries = Object.entries(TREND_STATUS_META);
+  const values = entries.flatMap(([key]) => series?.[key] || []);
+  const maxValue = Math.max(1, ...values, 0);
+
+  const buildPoints = (points) => {
+    if (!points?.length) return '';
+    return points
+      .map((value, index) => {
+        const x = points.length === 1 ? width / 2 : (index / (points.length - 1)) * width;
+        const y = height - (value / maxValue) * (height - 6) - 3;
+        return `${x},${Number.isFinite(y) ? y : height - 3}`;
+      })
+      .join(' ');
+  };
+
+  return (
+    <div className="rounded-[22px] border border-white/8 bg-black/10 p-4">
+      <TrendLegend />
+      <div className="mt-4">
+        <svg viewBox={`0 0 ${width} ${height}`} className="h-32 w-full overflow-visible">
+          {[0.25, 0.5, 0.75].map((ratio) => {
+            const y = height - ratio * (height - 6) - 3;
+            return <line key={ratio} x1="0" y1={y} x2={width} y2={y} stroke="rgba(255,255,255,0.08)" strokeWidth="0.6" strokeDasharray="2 2" />;
+          })}
+          <line x1="0" y1={height - 3} x2={width} y2={height - 3} stroke="rgba(255,255,255,0.1)" strokeWidth="0.8" />
+          {entries.map(([key, meta]) => {
+            const points = series?.[key] || [];
+            const pointString = buildPoints(points);
+            return pointString ? (
+              <polyline
+                key={key}
+                fill="none"
+                stroke={meta.color}
+                strokeWidth="2.2"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                points={pointString}
+              />
+            ) : null;
+          })}
+          {entries.map(([key, meta]) => {
+            const points = series?.[key] || [];
+            return points.map((value, index) => {
+              const x = points.length === 1 ? width / 2 : (index / (points.length - 1)) * width;
+              const y = height - (value / maxValue) * (height - 6) - 3;
+              return <circle key={`${key}-${labels?.[index] || index}`} cx={x} cy={y} r="1.75" fill={meta.color} />;
+            });
+          })}
+        </svg>
+      </div>
+      <div className="mt-3 flex items-center justify-between gap-3 text-[11px] text-[var(--text-muted)]">
+        <span>{formatTrendLabel(labels?.[0])}</span>
+        <span>7 ngày gần nhất</span>
+        <span>{formatTrendLabel(labels?.[labels.length - 1])}</span>
+      </div>
+    </div>
+  );
+}
+
 function EmptyState({ title, description }) {
   return (
     <div className="rounded-[20px] border border-dashed border-white/10 bg-black/10 px-4 py-6 text-center sm:rounded-[22px] sm:px-5 sm:py-7">
@@ -448,7 +763,10 @@ function App() {
   const [campaigns, setCampaigns] = useState([]);
   const [videos, setVideos] = useState([]);
   const [interactions, setInteractions] = useState([]);
-  const [messageLogs, setMessageLogs] = useState([]);
+  const [conversationList, setConversationList] = useState([]);
+  const [selectedConversationId, setSelectedConversationId] = useState(null);
+  const [selectedConversation, setSelectedConversation] = useState(null);
+  const [selectedConversationLogs, setSelectedConversationLogs] = useState([]);
   const [systemInfo, setSystemInfo] = useState(null);
   const [formData, setFormData] = useState({ name: '', source_url: '', auto_post: false, target_page_id: '', schedule_interval: 30 });
   const [fbPages, setFbPages] = useState([]);
@@ -457,7 +775,9 @@ function App() {
   const [stats, setStats] = useState(DEFAULT_STATS);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
-  const [filters, setFilters] = useState({ status: 'all', campaignId: 'all' });
+  const [filteredVideoTotal, setFilteredVideoTotal] = useState(0);
+  const [filters, setFilters] = useState({ status: 'all', campaignId: 'all', sourcePlatform: 'all' });
+  const [campaignSourceFilter, setCampaignSourceFilter] = useState('all');
   const [token, setToken] = useState(localStorage.getItem('token'));
   const [sessionExpiresAt, setSessionExpiresAt] = useState(localStorage.getItem('token_expires_at'));
   const [loginUser, setLoginUser] = useState('');
@@ -486,6 +806,14 @@ function App() {
   const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [expandedItems, setExpandedItems] = useState({});
   const [showAllMetrics, setShowAllMetrics] = useState(false);
+  const [overviewSourceFilter, setOverviewSourceFilter] = useState('all');
+  const [conversationStatusFilter, setConversationStatusFilter] = useState('all');
+  const [manualReplyDraft, setManualReplyDraft] = useState('');
+  const [conversationNoteDraft, setConversationNoteDraft] = useState('');
+  const [conversationAssigneeDraft, setConversationAssigneeDraft] = useState('');
+  const [pendingOperatorComposerId, setPendingOperatorComposerId] = useState(null);
+  const manualReplyPanelRef = useRef(null);
+  const manualReplyInputRef = useRef(null);
 
   const isAdmin = currentUser?.role === 'admin';
   const staleWorkers = workers.filter((worker) => !worker.is_online);
@@ -494,7 +822,38 @@ function App() {
   const warningCount = systemInfo?.warnings?.length || 0;
   const invalidPages = fbPages.filter((pageItem) => getResolvedPageTokenKind(pageItem, pageChecks[pageItem.page_id]) !== 'page_access_token');
   const connectedMessagePages = fbPages.filter((pageItem) => pageChecks[pageItem.page_id]?.messenger_connection?.connected).length;
-  const focusCampaigns = campaigns.filter((campaign) => campaign.last_sync_status === 'failed' || campaign.video_counts?.failed > 0).slice(0, 3);
+  const focusCampaignCandidates = campaigns.filter((campaign) => campaign.last_sync_status === 'failed' || campaign.video_counts?.failed > 0);
+  const focusCampaigns = focusCampaignCandidates.slice(0, 3);
+  const campaignSourceSummary = summarizeSourceCounts(campaigns, (campaign) => campaign.source_platform);
+  const filteredCampaigns = campaigns.filter((campaign) => campaignSourceFilter === 'all' || campaign.source_platform === campaignSourceFilter);
+  const overviewSourceBreakdown = [
+    {
+      platform: 'tiktok',
+      ...getSourcePlatformMeta('tiktok'),
+      campaigns: stats.by_source?.tiktok?.campaigns ?? 0,
+      videos: stats.by_source?.tiktok?.videos ?? 0,
+      ready: stats.by_source?.tiktok?.ready ?? 0,
+      trend: stats.source_trends?.series?.tiktok || { ready: [], posted: [], failed: [] },
+    },
+    {
+      platform: 'youtube',
+      ...getSourcePlatformMeta('youtube'),
+      campaigns: stats.by_source?.youtube?.campaigns ?? 0,
+      videos: stats.by_source?.youtube?.videos ?? 0,
+      ready: stats.by_source?.youtube?.ready ?? 0,
+      trend: stats.source_trends?.series?.youtube || { ready: [], posted: [], failed: [] },
+    },
+  ];
+  const visibleOverviewSources = overviewSourceFilter === 'all'
+    ? overviewSourceBreakdown
+    : overviewSourceBreakdown.filter((item) => item.platform === overviewSourceFilter);
+  const overviewSourceMax = Math.max(
+    1,
+    ...visibleOverviewSources.flatMap((item) => [item.campaigns, item.videos, item.ready]),
+  );
+  const overviewFocusCampaigns = focusCampaignCandidates
+    .filter((campaign) => overviewSourceFilter === 'all' || campaign.source_platform === overviewSourceFilter)
+    .slice(0, 3);
   const runtimeSettings = runtimeConfig?.settings || {};
   const runtimeDerived = runtimeConfig?.derived || {};
   const totalTaskPages = Math.max(1, Math.ceil(tasks.length / TASK_PAGE_SIZE));
@@ -502,6 +861,14 @@ function App() {
   const totalEventPages = Math.max(1, Math.ceil(events.length / SYSTEM_EVENT_PAGE_SIZE));
   const pagedEvents = events.slice((eventPage - 1) * SYSTEM_EVENT_PAGE_SIZE, eventPage * SYSTEM_EVENT_PAGE_SIZE);
   const toggleExpandedItem = (key) => setExpandedItems((current) => ({ ...current, [key]: !current[key] }));
+  const handoffConversations = conversationList.filter((conversation) => conversation.status === 'operator_active');
+  const resolvedConversations = conversationList.filter((conversation) => conversation.status === 'resolved');
+  const visibleConversations = conversationStatusFilter === 'all'
+    ? conversationList
+    : conversationList.filter((conversation) => conversation.status === conversationStatusFilter);
+  const selectedConversationStatusMeta = getConversationStatusMeta(selectedConversation?.status);
+  const selectedConversationTimeline = buildConversationTimeline(selectedConversationLogs);
+  const assignableUsers = isAdmin ? users.filter((user) => user.is_active) : (currentUser ? [currentUser] : []);
 
   const authFetch = async (url, options = {}) => {
     if (sessionExpiresAt && new Date(sessionExpiresAt).getTime() <= Date.now()) {
@@ -547,14 +914,15 @@ function App() {
       const params = new URLSearchParams({ page: String(page), limit: '10' });
       if (filters.status !== 'all') params.set('status', filters.status);
       if (filters.campaignId !== 'all') params.set('campaign_id', filters.campaignId);
+      if (filters.sourcePlatform !== 'all') params.set('source_platform', filters.sourcePlatform);
 
-      const [campaignsData, statsData, videosData, fbData, logsData, messageLogsData, systemData, healthData, taskData, eventData, workerData, userData] = await Promise.all([
+      const [campaignsData, statsData, videosData, fbData, logsData, conversationsData, systemData, healthData, taskData, eventData, workerData, userData] = await Promise.all([
         requestJson(`${API_URL}/campaigns/`),
         requestJson(`${API_URL}/campaigns/stats`),
         requestJson(`${API_URL}/campaigns/videos?${params.toString()}`),
         requestJson(`${API_URL}/facebook/config`),
         requestJson(`${API_URL}/webhooks/logs`),
-        requestJson(`${API_URL}/webhooks/messages`),
+        requestJson(`${API_URL}/webhooks/conversations?limit=80`),
         requestJson(`${API_URL}/system/overview`),
         requestJson(`${API_URL}/system/health`),
         requestJson(`${API_URL}/system/tasks?limit=${TASK_FETCH_LIMIT}`),
@@ -567,10 +935,11 @@ function App() {
       setCampaigns(campaignsData);
       setStats(statsData);
       setVideos(videosData.videos);
+      setFilteredVideoTotal(videosData.total ?? 0);
       setTotalPages(videosData.pages);
       setFbPages(fbData);
       setInteractions(logsData);
-      setMessageLogs(messageLogsData);
+      setConversationList(conversationsData.conversations || []);
       setSystemInfo(systemData);
       setHealthInfo(healthData);
       setTasks(taskData.tasks || []);
@@ -591,6 +960,24 @@ function App() {
     const payload = await requestJson(`${API_URL}/system/runtime-config`);
     setRuntimeConfig(payload);
     setRuntimeForm(extractRuntimeForm(payload));
+  };
+
+  const loadConversationDetail = async (conversationId, { silent = false } = {}) => {
+    if (!token || !conversationId) {
+      setSelectedConversation(null);
+      setSelectedConversationLogs([]);
+      return null;
+    }
+
+    try {
+      const payload = await requestJson(`${API_URL}/webhooks/conversations/${conversationId}`);
+      setSelectedConversation(payload.conversation || null);
+      setSelectedConversationLogs(payload.logs || []);
+      return payload;
+    } catch (error) {
+      if (!silent) showNotice('error', error.message);
+      return null;
+    }
   };
 
   const runAction = async (key, action) => {
@@ -623,7 +1010,7 @@ function App() {
     fetchDashboard();
     const interval = setInterval(fetchDashboard, AUTO_REFRESH_MS);
     return () => clearInterval(interval);
-  }, [token, page, filters.status, filters.campaignId]);
+  }, [token, page, filters.status, filters.campaignId, filters.sourcePlatform]);
   /* eslint-enable react-hooks/exhaustive-deps */
 
   useEffect(() => {
@@ -696,6 +1083,60 @@ function App() {
       return nextDrafts;
     });
   }, [videos]);
+
+  useEffect(() => {
+    if (conversationList.length === 0) {
+      setSelectedConversationId(null);
+      setSelectedConversation(null);
+      setSelectedConversationLogs([]);
+      return;
+    }
+
+    const exists = conversationList.some((conversation) => conversation.id === selectedConversationId);
+    if (!exists) setSelectedConversationId(conversationList[0].id);
+  }, [conversationList, selectedConversationId]);
+
+  /* eslint-disable react-hooks/exhaustive-deps */
+  useEffect(() => {
+    if (!token || !selectedConversationId) return;
+    loadConversationDetail(selectedConversationId, { silent: true });
+  }, [token, selectedConversationId, lastUpdatedAt]);
+  /* eslint-enable react-hooks/exhaustive-deps */
+
+  useEffect(() => {
+    if (!selectedConversation) {
+      setConversationNoteDraft('');
+      setConversationAssigneeDraft('');
+      setManualReplyDraft('');
+      return;
+    }
+
+    setConversationNoteDraft(selectedConversation.internal_note || '');
+    setConversationAssigneeDraft(
+      selectedConversation.assigned_to_user_id
+        || (!isAdmin && currentUser?.id ? currentUser.id : ''),
+    );
+  }, [selectedConversation, isAdmin, currentUser?.id]);
+
+  useEffect(() => {
+    if (
+      !pendingOperatorComposerId
+      || !selectedConversation
+      || selectedConversation.id !== pendingOperatorComposerId
+      || selectedConversation.status !== 'operator_active'
+    ) {
+      return;
+    }
+
+    setConversationStatusFilter('operator_active');
+    const timeout = setTimeout(() => {
+      manualReplyPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      manualReplyInputRef.current?.focus();
+      setPendingOperatorComposerId(null);
+    }, 120);
+
+    return () => clearTimeout(timeout);
+  }, [pendingOperatorComposerId, selectedConversation]);
 
   const handleSectionChange = (sectionId) => {
     setActiveSection(sectionId);
@@ -853,6 +1294,75 @@ function App() {
         ...current,
         [pageId]: buildReplyAutomationDraft(payload.page),
       }));
+    }
+  };
+
+  const handleConversationUpdate = async (conversationId, payload, keySuffix = 'update') => {
+    if (!conversationId) {
+      showNotice('error', 'Không tìm thấy cuộc trò chuyện để cập nhật.');
+      return null;
+    }
+
+    const result = await runAction(`conversation-${keySuffix}-${conversationId}`, () => requestJson(`${API_URL}/webhooks/conversations/${conversationId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }));
+    if (result?.conversation) {
+      setConversationList((current) => current.map((conversation) => (
+        conversation.id === conversationId
+          ? { ...conversation, ...result.conversation }
+          : conversation
+      )));
+      if (selectedConversationId === conversationId) {
+        setSelectedConversation((current) => ({ ...(current || {}), ...result.conversation }));
+      }
+      if (result.conversation.status === 'operator_active') {
+        setConversationStatusFilter('operator_active');
+        setPendingOperatorComposerId(conversationId);
+      }
+      await loadConversationDetail(conversationId, { silent: true });
+    }
+    return result;
+  };
+
+  const handleConversationStatusChange = async (conversationId, status, handoffReason = '') => {
+    await handleConversationUpdate(conversationId, { status, handoff_reason: handoffReason }, `status-${status}`);
+  };
+
+  const handleConversationMetaSave = async () => {
+    if (!selectedConversationId) {
+      showNotice('error', 'Bạn chưa chọn cuộc trò chuyện nào.');
+      return;
+    }
+
+    const payload = {
+      assigned_to_user_id: conversationAssigneeDraft || '',
+      internal_note: conversationNoteDraft,
+    };
+    await handleConversationUpdate(selectedConversationId, payload, 'meta');
+  };
+
+  const handleManualReply = async (markResolved = false) => {
+    if (!selectedConversationId) {
+      showNotice('error', 'Bạn chưa chọn cuộc trò chuyện nào.');
+      return;
+    }
+
+    const message = manualReplyDraft.trim();
+    if (message.length < 2) {
+      showNotice('error', 'Nội dung phản hồi cần ít nhất 2 ký tự.');
+      return;
+    }
+
+    const payload = await runAction(`conversation-reply-${selectedConversationId}`, () => requestJson(`${API_URL}/webhooks/conversations/${selectedConversationId}/reply`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, mark_resolved: markResolved }),
+    }));
+    if (payload?.conversation) {
+      setManualReplyDraft('');
+      await loadConversationDetail(selectedConversationId, { silent: true });
     }
   };
 
@@ -1102,7 +1612,84 @@ function App() {
         </div>
       </Panel>
 
-      <Panel className="2xl:col-span-7" eyebrow="Nhịp vận hành" title="Mốc thời gian quan trọng">
+      <Panel
+        className="2xl:col-span-7"
+        eyebrow="Nguồn nội dung"
+        title="Hiệu quả TikTok vs YouTube Shorts"
+        action={(
+          <select className={cx(FIELD_CLASS, 'min-w-[180px]')} value={overviewSourceFilter} onChange={(event) => setOverviewSourceFilter(event.target.value)}>
+            {SOURCE_PLATFORM_FILTERS.map((option) => <option key={option.value} value={option.value} style={{ color: '#06101a' }}>{option.label}</option>)}
+          </select>
+        )}
+      >
+        <div className="grid gap-4 xl:grid-cols-2">
+          {visibleOverviewSources.map((sourceItem) => (
+            <div key={sourceItem.platform} className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Nguồn đang theo dõi</div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <StatusPill tone={sourceItem.tone}>{sourceItem.label}</StatusPill>
+                  </div>
+                </div>
+                <div className="rounded-[22px] border border-white/8 bg-black/10 px-4 py-3 text-right">
+                  <div className="text-[10px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Campaign</div>
+                  <div className="mt-2 font-display text-[1.35rem] font-semibold text-white">{sourceItem.campaigns}</div>
+                </div>
+              </div>
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <InfoRow label="Tổng video" value={sourceItem.videos} emphasis />
+                <InfoRow label="Video sẵn sàng" value={sourceItem.ready} />
+              </div>
+              <div className="mt-4 space-y-3">
+                <SourceBreakdownBar label="Campaign" value={sourceItem.campaigns} max={overviewSourceMax} tone={sourceItem.tone} detail="Số chiến dịch đã gắn nguồn này." />
+                <SourceBreakdownBar label="Tổng video" value={sourceItem.videos} max={overviewSourceMax} tone={sourceItem.tone} detail="Tổng video đã vào hàng chờ hoặc lịch sử đăng." />
+                <SourceBreakdownBar label="Sẵn sàng đăng" value={sourceItem.ready} max={overviewSourceMax} tone={sourceItem.tone} detail="Video đang ở trạng thái ready." />
+              </div>
+              <div className="mt-4">
+                <div className="mb-3 text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Xu hướng 7 ngày</div>
+                <TrendTimelineChart labels={stats.source_trends?.labels || []} series={sourceItem.trend} />
+              </div>
+            </div>
+          ))}
+        </div>
+        <div className="mt-5 rounded-[24px] border border-white/8 bg-black/10 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Chiến dịch cần xem theo nguồn</div>
+              <div className="mt-1 text-sm text-[var(--text-soft)]">
+                {overviewSourceFilter === 'all' ? 'Đang hiển thị campaign nóng của toàn bộ nguồn.' : `Đang lọc theo ${getSourcePlatformMeta(overviewSourceFilter).label.toLowerCase()}.`}
+              </div>
+            </div>
+            <StatusPill tone={overviewFocusCampaigns.length ? 'amber' : 'emerald'}>{overviewFocusCampaigns.length} mục</StatusPill>
+          </div>
+          <div className="mt-4 space-y-3">
+            {overviewFocusCampaigns.length === 0 ? (
+              <div className="rounded-[22px] border border-white/8 bg-black/10 px-4 py-4 text-sm text-[var(--text-soft)]">
+                Không có chiến dịch nổi bật khớp bộ lọc nguồn.
+              </div>
+            ) : overviewFocusCampaigns.map((campaign) => {
+              const sourceMeta = getSourcePlatformMeta(campaign.source_platform);
+              return (
+                <button key={campaign.id} type="button" onClick={() => handleSectionChange('campaigns')} className="w-full rounded-[22px] border border-white/8 bg-black/10 px-4 py-4 text-left transition hover:border-cyan-400/20 hover:bg-cyan-400/6">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="font-medium text-white">{campaign.name}</div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <StatusPill tone={sourceMeta.tone}>{sourceMeta.label}</StatusPill>
+                        <StatusPill tone="slate">{getSyncStateMeta(campaign.last_sync_status).label}</StatusPill>
+                      </div>
+                    </div>
+                    <div className="text-sm text-[var(--text-soft)]">{campaign.video_counts?.failed ?? 0} video lỗi</div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </Panel>
+
+      <Panel className="2xl:col-span-5" eyebrow="Nhịp vận hành" title="Mốc thời gian quan trọng">
         <div className="grid gap-4 xl:grid-cols-2">
           <InfoRow label="Lượt đăng kế tiếp" value={formatRelTime(stats.next_publish)} emphasis />
           <InfoRow label="Mốc cuối hàng chờ" value={formatDateTime(stats.queue_end)} />
@@ -1201,6 +1788,9 @@ function App() {
   const renderCampaignSection = () => (
     <div className="grid gap-6 2xl:grid-cols-12">
       <Panel className="2xl:col-span-7" eyebrow="Nguồn mới" title="Tạo chiến dịch đăng tự động">
+        {(() => {
+          const sourcePreview = detectSourcePreview(formData.source_url);
+          return (
         <form onSubmit={handleCampaignSubmit} className="grid gap-4 md:grid-cols-2">
           <label className="space-y-2 md:col-span-2">
             <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Trang đích</span>
@@ -1217,9 +1807,24 @@ function App() {
             <input required type="number" min="0" className={FIELD_CLASS} value={formData.schedule_interval} onChange={(event) => setFormData({ ...formData, schedule_interval: parseInt(event.target.value, 10) || 0 })} />
           </label>
           <label className="space-y-2 md:col-span-2">
-            <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Nguồn TikTok</span>
-            <input required type="url" className={FIELD_CLASS} placeholder="https://www.tiktok.com/@..." value={formData.source_url} onChange={(event) => setFormData({ ...formData, source_url: event.target.value })} />
+            <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Nguồn nội dung</span>
+            <input required type="url" className={FIELD_CLASS} placeholder="https://www.tiktok.com/@... hoặc https://www.youtube.com/shorts/..." value={formData.source_url} onChange={(event) => setFormData({ ...formData, source_url: event.target.value })} />
           </label>
+          <div className="md:col-span-2 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+            <div className="rounded-[22px] border border-white/8 bg-black/10 px-4 py-4">
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Nhận diện nguồn</div>
+                <StatusPill tone={sourcePreview.tone}>{sourcePreview.title}</StatusPill>
+              </div>
+              <div className="mt-3 text-sm leading-7 text-[var(--text-soft)]">{sourcePreview.detail}</div>
+            </div>
+            <div className="rounded-[22px] border border-white/8 bg-black/10 px-4 py-4 text-sm leading-7 text-[var(--text-soft)]">
+              <div className="text-[11px] uppercase tracking-[0.24em] text-[var(--text-muted)]">Ví dụ hợp lệ</div>
+              <div className="mt-3 break-all">TikTok: `https://www.tiktok.com/@creator/video/...`</div>
+              <div className="mt-1 break-all">YouTube Shorts: `https://www.youtube.com/shorts/...`</div>
+              <div className="mt-1 break-all">Nguồn Shorts: `https://www.youtube.com/@creator/shorts`</div>
+            </div>
+          </div>
           <label className="md:col-span-2 flex items-center gap-3 rounded-[24px] border border-white/8 bg-black/10 px-4 py-4">
             <input type="checkbox" checked={formData.auto_post} onChange={(event) => setFormData({ ...formData, auto_post: event.target.checked })} />
             <div>
@@ -1234,6 +1839,8 @@ function App() {
             </button>
           </div>
         </form>
+          );
+        })()}
       </Panel>
 
       <Panel className="2xl:col-span-5" eyebrow="Fanpage" title="Kết nối hoặc cập nhật trang Facebook">
@@ -1309,13 +1916,33 @@ function App() {
       </Panel>
 
       <Panel className="2xl:col-span-8" eyebrow="Danh mục chiến dịch" title="Toàn bộ chiến dịch đang quản lý">
-        {campaigns.length === 0 ? (
-          <EmptyState title="Chưa có chiến dịch nào" description="Tạo chiến dịch để bắt đầu." />
+        <div className="mb-5 grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
+          <label className="space-y-2">
+            <span className="flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">
+              <Filter className="h-3.5 w-3.5" />
+              Nguồn chiến dịch
+            </span>
+            <select className={FIELD_CLASS} value={campaignSourceFilter} onChange={(event) => setCampaignSourceFilter(event.target.value)}>
+              {SOURCE_PLATFORM_FILTERS.map((option) => <option key={option.value} value={option.value} style={{ color: '#06101a' }}>{option.label}</option>)}
+            </select>
+          </label>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <InfoRow label="Campaign TikTok" value={campaignSourceSummary.tiktok} emphasis={campaignSourceFilter === 'tiktok'} />
+            <InfoRow label="Campaign Shorts" value={campaignSourceSummary.youtube} emphasis={campaignSourceFilter === 'youtube'} />
+            <InfoRow label="Khớp bộ lọc" value={filteredCampaigns.length} />
+          </div>
+        </div>
+        {filteredCampaigns.length === 0 ? (
+          <EmptyState
+            title={campaigns.length === 0 ? 'Chưa có chiến dịch nào' : 'Không có chiến dịch khớp bộ lọc'}
+            description={campaigns.length === 0 ? 'Tạo chiến dịch để bắt đầu.' : 'Đổi bộ lọc nguồn để xem thêm.'}
+          />
         ) : (
           <div className="grid gap-4 xl:grid-cols-2">
-            {campaigns.map((campaign) => {
+            {filteredCampaigns.map((campaign) => {
               const syncMeta = getSyncStateMeta(campaign.last_sync_status);
               const isExpanded = !!expandedItems[`campaign:${campaign.id}`];
+              const sourcePlatformMeta = getSourcePlatformMeta(campaign.source_platform);
               return (
                 <article key={campaign.id} className="rounded-[22px] border border-white/8 bg-black/10 p-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1330,6 +1957,8 @@ function App() {
                           <StatusIcon status={syncMeta.tone} />
                           {syncMeta.label}
                         </span>
+                        <StatusPill tone={sourcePlatformMeta.tone}>{sourcePlatformMeta.label}</StatusPill>
+                        <StatusPill tone="slate">{getSourceKindLabel(campaign.source_kind)}</StatusPill>
                       </div>
                     </div>
                     <div className="rounded-[22px] border border-white/8 bg-black/10 px-4 py-3 text-right">
@@ -1356,6 +1985,8 @@ function App() {
                         </a>
                       </div>
                       <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                        <InfoRow label="Nền tảng nguồn" value={sourcePlatformMeta.label} />
+                        <InfoRow label="Kiểu nguồn" value={getSourceKindLabel(campaign.source_kind)} />
                         <InfoRow label="Tổng video" value={campaign.video_counts?.total ?? 0} emphasis />
                         <InfoRow label="Sẵn sàng" value={campaign.video_counts?.ready ?? 0} />
                         <InfoRow label="Thất bại" value={campaign.video_counts?.failed ?? 0} />
@@ -1398,7 +2029,7 @@ function App() {
   const renderQueueSection = () => (
     <div className="space-y-6">
       <Panel eyebrow="Bộ lọc" title="Hàng chờ đăng bài">
-        <div className="grid gap-4 xl:grid-cols-[220px_280px_minmax(0,1fr)]">
+        <div className="grid gap-4 xl:grid-cols-[220px_280px_220px_minmax(0,1fr)]">
           <label className="space-y-2">
             <span className="flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">
               <Filter className="h-3.5 w-3.5" />
@@ -1421,8 +2052,19 @@ function App() {
               {campaigns.map((campaign) => <option key={campaign.id} value={campaign.id} style={{ color: '#06101a' }}>{campaign.name}</option>)}
             </select>
           </label>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <InfoRow label="Video sẵn sàng" value={stats.ready ?? 0} emphasis />
+          <label className="space-y-2">
+            <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Nguồn nội dung</span>
+            <select className={FIELD_CLASS} value={filters.sourcePlatform} onChange={(event) => {
+              setPage(1);
+              setFilters((current) => ({ ...current, sourcePlatform: event.target.value }));
+            }}>
+              {SOURCE_PLATFORM_FILTERS.map((option) => <option key={option.value} value={option.value} style={{ color: '#06101a' }}>{option.label}</option>)}
+            </select>
+          </label>
+          <div className="grid gap-3 sm:grid-cols-5">
+            <InfoRow label="Khớp bộ lọc" value={filteredVideoTotal} emphasis />
+            <InfoRow label="TikTok sẵn sàng" value={stats.by_source?.tiktok?.ready ?? 0} />
+            <InfoRow label="Shorts sẵn sàng" value={stats.by_source?.youtube?.ready ?? 0} />
             <InfoRow label="Đến lượt kế tiếp" value={formatRelTime(stats.next_publish)} />
             <InfoRow label="Cuối hàng chờ" value={formatDateTime(stats.queue_end)} />
           </div>
@@ -1436,6 +2078,7 @@ function App() {
           <div className="space-y-4">
             {videos.map((video) => {
               const isExpanded = !!expandedItems[`video:${video.id}`];
+              const sourcePlatformMeta = getSourcePlatformMeta(video.source_platform);
               return (
                 <article key={video.id} className="rounded-[22px] border border-white/8 bg-black/10 p-4">
                   <div className="flex flex-wrap items-start justify-between gap-4">
@@ -1447,6 +2090,8 @@ function App() {
                           <StatusIcon status={video.status} />
                           {getStatusLabel(video.status)}
                         </span>
+                        <StatusPill tone={sourcePlatformMeta.tone}>{sourcePlatformMeta.label}</StatusPill>
+                        <StatusPill tone="slate">{getSourceKindLabel(video.source_kind)}</StatusPill>
                         <StatusPill tone={video.target_page_name ? 'sky' : 'amber'} icon={Globe2}>{video.target_page_name || video.target_page_id || 'Chưa gắn fanpage'}</StatusPill>
                       </div>
                     </div>
@@ -1468,6 +2113,10 @@ function App() {
                           <div className="flex items-center gap-2 text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">
                             <CloudDownload className="h-3.5 w-3.5" />
                             Nguồn video
+                          </div>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <StatusPill tone={sourcePlatformMeta.tone}>{sourcePlatformMeta.label}</StatusPill>
+                            <StatusPill tone="slate">{getSourceKindLabel(video.source_kind)}</StatusPill>
                           </div>
                           {video.source_video_url ? (
                             <a href={video.source_video_url} target="_blank" rel="noreferrer" className="mt-3 inline-flex items-center gap-2 break-all text-sm text-cyan-100 hover:text-white">
@@ -1580,6 +2229,9 @@ function App() {
           <InfoRow label="Inbox đang chờ" value={systemInfo?.pending_message_replies ?? 0} emphasis />
           <InfoRow label="Fanpage bật inbox AI" value={systemInfo?.message_auto_reply_pages ?? 0} />
           <InfoRow label="Webhook fanpage đã nối" value={`${connectedMessagePages}/${fbPages.length || 0}`} />
+          <InfoRow label="Cần operator xử lý" value={handoffConversations.length} emphasis={handoffConversations.length > 0} />
+          <InfoRow label="Đã xử lý" value={resolvedConversations.length} />
+          <InfoRow label="Tổng conversation" value={conversationList.length} />
         </div>
       </Panel>
 
@@ -1751,58 +2403,323 @@ function App() {
         )}
       </Panel>
 
-      <Panel eyebrow="Nhật ký inbox" title="Tin nhắn fanpage gần nhất">
-        {messageLogs.length === 0 ? (
-          <EmptyState title="Chưa có tin nhắn inbox" description="Tin nhắn mới sẽ hiện tại đây." />
-        ) : (
-          <div className="space-y-4">
-            {messageLogs.map((log) => {
-              const targetPage = fbPages.find((pageItem) => pageItem.page_id === log.page_id);
-              const isExpanded = !!expandedItems[`message:${log.id}`];
-              return (
-                <article key={log.id} className="rounded-[22px] border border-white/8 bg-black/10 p-4">
-                  <div className="flex flex-wrap items-start justify-between gap-4">
-                    <div>
-                      <div className="font-medium text-white">{targetPage?.page_name || log.page_id}</div>
-                      <div className="mt-1 text-xs text-[var(--text-muted)]">Người gửi: {log.sender_id} • Tin nhắn: {log.facebook_message_id}</div>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className={cx('inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium', getStatusClasses(log.status))}>
-                        <StatusIcon status={log.status} />
-                        {getStatusLabel(log.status)}
-                      </span>
-                      <StatusPill tone="slate" icon={Clock}>{formatDateTime(log.created_at)}</StatusPill>
-                    </div>
-                  </div>
-                  <div className="mt-3 text-sm text-[var(--text-soft)]">{summarizeText(log.user_message, 'Chưa có tin nhắn.')}</div>
-                  <div className="mt-3 flex justify-start">
-                    <DetailToggle expanded={isExpanded} onClick={() => toggleExpandedItem(`message:${log.id}`)} />
-                  </div>
-                  {isExpanded ? (
-                    <>
-                      <div className="mt-5 grid gap-4 xl:grid-cols-2">
-                        <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
-                          <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Tin nhắn khách hàng</div>
-                          <div className="mt-3 whitespace-pre-wrap text-sm leading-7 text-white">{log.user_message}</div>
-                        </div>
-                        <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
-                          <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Phản hồi AI</div>
-                          <div className="mt-3 whitespace-pre-wrap text-sm leading-7 text-[var(--text-soft)]">{log.ai_reply || 'AI chưa phản hồi cho mục này.'}</div>
-                        </div>
-                      </div>
-                      {log.last_error ? (
-                        <div className="mt-4 rounded-[24px] border border-rose-400/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
-                          {log.last_error}
-                        </div>
-                      ) : null}
-                    </>
-                  ) : null}
-                </article>
-              );
-            })}
+      <Panel
+        eyebrow="Hộp thư operator"
+        title="Quản lý hội thoại theo conversation"
+        action={(
+          <div className="flex flex-wrap gap-2">
+            {[
+              { value: 'all', label: `Tất cả (${conversationList.length})` },
+              { value: 'operator_active', label: `Cần operator (${handoffConversations.length})` },
+              { value: 'ai_active', label: `AI đang xử lý (${conversationList.filter((conversation) => conversation.status === 'ai_active').length})` },
+              { value: 'resolved', label: `Đã xử lý (${resolvedConversations.length})` },
+            ].map((filterItem) => (
+              <button
+                key={filterItem.value}
+                type="button"
+                onClick={() => setConversationStatusFilter(filterItem.value)}
+                className={cx(
+                  BUTTON_GHOST,
+                  conversationStatusFilter === filterItem.value ? 'border-cyan-400/20 bg-cyan-400/10 text-cyan-100' : '',
+                )}
+              >
+                {filterItem.label}
+              </button>
+            ))}
           </div>
         )}
+      >
+        <div className="grid gap-5 2xl:grid-cols-[0.92fr_1.28fr]">
+          <div className="space-y-4">
+            {visibleConversations.length === 0 ? (
+              <EmptyState title="Chưa có conversation phù hợp" description="Tin nhắn inbox sẽ được gom theo conversation và hiện tại đây." />
+            ) : (
+              visibleConversations.map((conversation) => {
+                const targetPage = fbPages.find((pageItem) => pageItem.page_id === conversation.page_id);
+                const statusMeta = getConversationStatusMeta(conversation.status);
+                const isSelected = selectedConversationId === conversation.id;
+                return (
+                  <button
+                    key={conversation.id}
+                    type="button"
+                    onClick={() => setSelectedConversationId(conversation.id)}
+                    className={cx(
+                      'w-full rounded-[22px] border p-4 text-left transition',
+                      isSelected
+                        ? 'border-cyan-400/25 bg-cyan-400/10'
+                        : 'border-white/8 bg-black/10 hover:border-white/15 hover:bg-black/15',
+                    )}
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div>
+                        <div className="font-medium text-white">{targetPage?.page_name || conversation.page_id}</div>
+                        <div className="mt-1 text-xs text-[var(--text-muted)]">Người gửi: {conversation.sender_id}</div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <StatusPill tone={statusMeta.tone}>{statusMeta.label}</StatusPill>
+                        {conversation.current_intent ? <StatusPill tone="amber">{formatIntentLabel(conversation.current_intent)}</StatusPill> : null}
+                      </div>
+                    </div>
+                    <div className="mt-3 text-sm leading-6 text-[var(--text-soft)]">
+                      {summarizeText(conversation.latest_preview, 'Chưa có nội dung.')}
+                    </div>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <InfoRow label="Lượt chat" value={conversation.message_count ?? 0} />
+                      <InfoRow label="Cập nhật cuối" value={formatDateTime(conversation.latest_activity_at)} />
+                      <InfoRow label="Người xử lý" value={conversation.assigned_user?.display_name || 'Chưa gán'} />
+                      <InfoRow label="Nguồn preview" value={conversation.latest_preview_direction === 'page' ? 'Trang' : 'Khách'} />
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          <div>
+            {!selectedConversation ? (
+              <EmptyState title="Chọn một cuộc trò chuyện" description="Danh sách bên trái đã được gom theo conversation để operator xử lý gọn hơn." />
+            ) : (
+              <div className="space-y-4">
+                <div ref={manualReplyPanelRef} className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div>
+                      <div className="font-display text-xl font-semibold text-white">
+                        {fbPages.find((pageItem) => pageItem.page_id === selectedConversation.page_id)?.page_name || selectedConversation.page_id}
+                      </div>
+                      <div className="mt-1 text-sm text-[var(--text-muted)]">Người gửi: {selectedConversation.sender_id}</div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <StatusPill tone={selectedConversationStatusMeta.tone}>{selectedConversationStatusMeta.label}</StatusPill>
+                        {selectedConversation.current_intent ? <StatusPill tone="amber">{formatIntentLabel(selectedConversation.current_intent)}</StatusPill> : null}
+                        {selectedConversation.assigned_user ? <StatusPill tone="slate">Người xử lý: {selectedConversation.assigned_user.display_name}</StatusPill> : null}
+                      </div>
+                    </div>
+                    <div className="mobile-action-stack">
+                      {selectedConversation.facebook_thread_url ? (
+                        <a href={selectedConversation.facebook_thread_url} target="_blank" rel="noreferrer" className={BUTTON_GHOST}>
+                          <ExternalLink className="h-4 w-4" />
+                          Mở trên Facebook
+                        </a>
+                      ) : null}
+                      {selectedConversation.status === 'operator_active' ? (
+                        <>
+                          <button
+                            type="button"
+                            className={BUTTON_SECONDARY}
+                            onClick={() => handleConversationStatusChange(selectedConversation.id, 'resolved')}
+                            disabled={actionState[`conversation-status-resolved-${selectedConversation.id}`]}
+                          >
+                            <CircleCheck className="h-4 w-4" />
+                            {actionState[`conversation-status-resolved-${selectedConversation.id}`] ? 'Đang cập nhật...' : 'Đánh dấu đã xử lý'}
+                          </button>
+                          <button
+                            type="button"
+                            className={BUTTON_GHOST}
+                            onClick={() => handleConversationStatusChange(selectedConversation.id, 'ai_active')}
+                            disabled={actionState[`conversation-status-ai_active-${selectedConversation.id}`]}
+                          >
+                            <RefreshCw className="h-4 w-4" />
+                            {actionState[`conversation-status-ai_active-${selectedConversation.id}`] ? 'Đang cập nhật...' : 'Bật lại AI'}
+                          </button>
+                        </>
+                      ) : selectedConversation.status === 'resolved' ? (
+                        <>
+                          <button
+                            type="button"
+                            className={cx(BUTTON_GHOST, 'border-rose-400/20 bg-rose-400/10 text-rose-100 hover:border-rose-300/30 hover:bg-rose-400/15')}
+                            onClick={() => handleConversationStatusChange(selectedConversation.id, 'operator_active', 'Đã mở lại để operator hỗ trợ tiếp.')}
+                            disabled={actionState[`conversation-status-operator_active-${selectedConversation.id}`]}
+                          >
+                            <AlertTriangle className="h-4 w-4" />
+                            {actionState[`conversation-status-operator_active-${selectedConversation.id}`] ? 'Đang cập nhật...' : 'Mở lại cho operator'}
+                          </button>
+                          <button
+                            type="button"
+                            className={BUTTON_GHOST}
+                            onClick={() => handleConversationStatusChange(selectedConversation.id, 'ai_active')}
+                            disabled={actionState[`conversation-status-ai_active-${selectedConversation.id}`]}
+                          >
+                            <RefreshCw className="h-4 w-4" />
+                            {actionState[`conversation-status-ai_active-${selectedConversation.id}`] ? 'Đang cập nhật...' : 'Bật lại AI'}
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          className={cx(BUTTON_GHOST, 'border-rose-400/20 bg-rose-400/10 text-rose-100 hover:border-rose-300/30 hover:bg-rose-400/15')}
+                          onClick={() => handleConversationStatusChange(selectedConversation.id, 'operator_active', 'Đã chuyển cho nhân viên tư vấn hỗ trợ tiếp.')}
+                          disabled={actionState[`conversation-status-operator_active-${selectedConversation.id}`]}
+                        >
+                          <AlertTriangle className="h-4 w-4" />
+                          {actionState[`conversation-status-operator_active-${selectedConversation.id}`] ? 'Đang cập nhật...' : 'Chuyển operator'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <InfoRow label="Tin khách cuối" value={formatDateTime(selectedConversation.last_customer_message_at)} />
+                    <InfoRow label="AI phản hồi cuối" value={formatDateTime(selectedConversation.last_ai_reply_at)} />
+                    <InfoRow label="Operator phản hồi cuối" value={formatDateTime(selectedConversation.last_operator_reply_at)} />
+                    <InfoRow label="Đóng case lúc" value={formatDateTime(selectedConversation.resolved_at)} />
+                  </div>
+                </div>
+
+                <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+                  <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Memory hội thoại</div>
+                      {selectedConversation.status === 'operator_active' ? <StatusPill tone="rose" icon={AlertTriangle}>Đang cần người thật</StatusPill> : null}
+                    </div>
+                    <div className="mt-3 text-sm leading-7 text-white">{selectedConversation.conversation_summary || 'Chưa có tóm tắt hội thoại.'}</div>
+                    {selectedConversation.handoff_reason ? (
+                      <div className="mt-4 rounded-[20px] border border-rose-400/20 bg-rose-400/10 px-4 py-3 text-sm leading-7 text-rose-100">
+                        {selectedConversation.handoff_reason}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                    <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Intent và dữ kiện nhớ</div>
+                    <div className="mt-3 space-y-3">
+                      <InfoRow label="Intent hiện tại" value={formatIntentLabel(selectedConversation.current_intent)} emphasis />
+                      <InfoRow label="Người xử lý" value={selectedConversation.assigned_user?.display_name || 'Chưa gán'} />
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {getConversationFactEntries(selectedConversation).length > 0
+                        ? getConversationFactEntries(selectedConversation).map(([key, value]) => (
+                          <StatusPill key={`${selectedConversation.id}-${key}`} tone="slate">{`${formatIntentLabel(key)}: ${value}`}</StatusPill>
+                        ))
+                        : <StatusPill tone="slate">Chưa có facts</StatusPill>}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+                  <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                    <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Điều phối operator</div>
+                    <div className="mt-4 space-y-4">
+                      {isAdmin ? (
+                        <label className="block space-y-2">
+                          <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Giao cho</span>
+                          <select className={FIELD_CLASS} value={conversationAssigneeDraft} onChange={(event) => setConversationAssigneeDraft(event.target.value)}>
+                            <option value="">Chưa gán người xử lý</option>
+                            {assignableUsers.map((user) => (
+                              <option key={user.id} value={user.id}>
+                                {(user.display_name || user.username)} • {user.role}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      ) : (
+                        <button type="button" className={BUTTON_GHOST} onClick={() => setConversationAssigneeDraft(currentUser?.id || '')}>
+                          <UserPlus className="h-4 w-4" />
+                          Nhận xử lý cho mình
+                        </button>
+                      )}
+                      <label className="block space-y-2">
+                        <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Ghi chú nội bộ</span>
+                        <textarea
+                          className={cx(FIELD_CLASS, 'min-h-[140px] resize-y')}
+                          value={conversationNoteDraft}
+                          onChange={(event) => setConversationNoteDraft(event.target.value)}
+                          placeholder="Ghi chú nội bộ cho operator, không gửi cho khách."
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className={BUTTON_SECONDARY}
+                        onClick={handleConversationMetaSave}
+                        disabled={actionState[`conversation-meta-${selectedConversation.id}`]}
+                      >
+                        <CircleCheck className="h-4 w-4" />
+                        {actionState[`conversation-meta-${selectedConversation.id}`] ? 'Đang lưu...' : 'Lưu phân công và ghi chú'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Timeline cuộc trò chuyện</div>
+                      <StatusPill tone="slate">{selectedConversationLogs.length} bản ghi</StatusPill>
+                    </div>
+                    {selectedConversationTimeline.length === 0 ? (
+                      <div className="mt-4">
+                        <EmptyState title="Chưa có timeline" description="Lịch sử chat sẽ hiện ở đây khi có tin nhắn hoặc phản hồi." />
+                      </div>
+                    ) : (
+                      <div className="mt-4 space-y-3">
+                        {selectedConversationTimeline.map((event) => (
+                          <div
+                            key={event.id}
+                            className={cx(
+                              'rounded-[22px] border px-4 py-3',
+                              event.type === 'customer'
+                                ? 'border-white/8 bg-black/10'
+                                : event.type === 'operator'
+                                  ? 'border-amber-400/20 bg-amber-400/10'
+                                  : 'border-cyan-400/20 bg-cyan-400/10',
+                            )}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div className="font-medium text-white">{event.sourceLabel}</div>
+                              <StatusPill tone="slate" icon={Clock}>{formatDateTime(event.time)}</StatusPill>
+                            </div>
+                            <div className="mt-3 whitespace-pre-wrap text-sm leading-7 text-white">{event.text}</div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-[24px] border border-white/8 bg-black/10 p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Phản hồi thủ công</div>
+                      <div className="mt-2 text-sm text-[var(--text-soft)]">
+                        {selectedConversation.status === 'ai_active'
+                          ? 'AI đang xử lý cuộc chat này. Nếu cần can thiệp tay, hãy chuyển operator trước.'
+                          : 'Nhập nội dung để operator phản hồi trực tiếp từ dashboard.'}
+                      </div>
+                    </div>
+                    {selectedConversation.status !== 'ai_active' ? <StatusPill tone="rose">AI đang tạm dừng cho case này</StatusPill> : null}
+                  </div>
+                  <div className="mt-4 space-y-4">
+                    <textarea
+                      ref={manualReplyInputRef}
+                      className={cx(FIELD_CLASS, 'min-h-[140px] resize-y')}
+                      value={manualReplyDraft}
+                      onChange={(event) => setManualReplyDraft(event.target.value)}
+                      placeholder={selectedConversation.status === 'ai_active' ? 'Chuyển operator để phản hồi tay.' : 'Nhập phản hồi gửi cho khách hàng.'}
+                      disabled={selectedConversation.status === 'ai_active'}
+                    />
+                    <div className="mobile-action-stack">
+                      <button
+                        type="button"
+                        className={BUTTON_PRIMARY}
+                        onClick={() => handleManualReply(false)}
+                        disabled={selectedConversation.status === 'ai_active' || actionState[`conversation-reply-${selectedConversation.id}`]}
+                      >
+                        <MessagesSquare className="h-4 w-4" />
+                        {actionState[`conversation-reply-${selectedConversation.id}`] ? 'Đang gửi...' : 'Gửi phản hồi'}
+                      </button>
+                      <button
+                        type="button"
+                        className={BUTTON_SECONDARY}
+                        onClick={() => handleManualReply(true)}
+                        disabled={selectedConversation.status === 'ai_active' || actionState[`conversation-reply-${selectedConversation.id}`]}
+                      >
+                        <CircleCheck className="h-4 w-4" />
+                        {actionState[`conversation-reply-${selectedConversation.id}`] ? 'Đang gửi...' : 'Gửi và đánh dấu đã xử lý'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </Panel>
+
     </div>
   );
 
@@ -2110,6 +3027,20 @@ function App() {
       detail: `${systemInfo?.pending_comment_replies ?? 0} comment • ${systemInfo?.pending_message_replies ?? 0} inbox`,
       icon: Bot,
       tone: 'sky',
+    },
+    {
+      label: 'Nguồn TikTok',
+      value: stats.by_source?.tiktok?.campaigns ?? 0,
+      detail: `${stats.by_source?.tiktok?.ready ?? 0} video sẵn sàng`,
+      icon: Share2,
+      tone: 'sky',
+    },
+    {
+      label: 'Nguồn Shorts',
+      value: stats.by_source?.youtube?.campaigns ?? 0,
+      detail: `${stats.by_source?.youtube?.ready ?? 0} video sẵn sàng`,
+      icon: Play,
+      tone: 'rose',
     },
     { label: 'Worker trực tuyến', value: onlineWorkers, detail: staleWorkers.length ? `${staleWorkers.length} worker stale cần dọn` : 'Không có worker mất kết nối', icon: Radio, tone: staleWorkers.length ? 'amber' : 'emerald' },
   ];

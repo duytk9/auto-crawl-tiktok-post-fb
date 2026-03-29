@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from app.core.time import utc_now
 from app.models.models import SystemEvent, WorkerHeartbeat
 
 LOGGER_NAME = "social_tool"
@@ -20,7 +21,10 @@ def configure_logging() -> None:
     global _LOGGING_CONFIGURED
     if _LOGGING_CONFIGURED:
         return
-    logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL, logging.INFO), format="%(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, settings.LOG_LEVEL, logging.INFO))
+    if not root_logger.handlers:
+        logging.basicConfig(level=root_logger.level, format="%(message)s")
     _LOGGING_CONFIGURED = True
 
 
@@ -41,6 +45,25 @@ def _normalize_details(details: dict[str, Any] | None) -> dict[str, Any]:
     return normalized
 
 
+def log_structured(
+    scope: str,
+    level: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_details = _normalize_details(details)
+    payload = {
+        "timestamp": utc_now().isoformat(),
+        "scope": scope,
+        "level": level.upper(),
+        "message": message,
+        "details": normalized_details,
+    }
+    _get_logger(scope).log(getattr(logging, level.upper(), logging.INFO), json.dumps(payload, ensure_ascii=False))
+    return payload
+
+
 def record_event(
     scope: str,
     level: str,
@@ -51,14 +74,7 @@ def record_event(
     actor_user_id: str | None = None,
 ) -> None:
     normalized_details = _normalize_details(details)
-    payload = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "scope": scope,
-        "level": level.upper(),
-        "message": message,
-        "details": normalized_details,
-    }
-    _get_logger(scope).log(getattr(logging, level.upper(), logging.INFO), json.dumps(payload, ensure_ascii=False))
+    log_structured(scope, level, message, details=normalized_details)
 
     own_session = False
     session = db
@@ -116,7 +132,7 @@ def update_worker_heartbeat(
         heartbeat.current_task_id = current_task_id
         heartbeat.current_task_type = current_task_type
         heartbeat.details = _normalize_details(details) or None
-        heartbeat.last_seen_at = datetime.utcnow()
+        heartbeat.last_seen_at = utc_now()
         session.commit()
     finally:
         if own_session and session is not None:

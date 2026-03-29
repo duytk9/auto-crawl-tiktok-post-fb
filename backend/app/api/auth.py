@@ -1,4 +1,3 @@
-from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Security
@@ -9,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.time import utc_now
 from app.models.models import User, UserRole
 from app.services.accounts import serialize_user
 from app.services.observability import record_event
@@ -96,7 +96,7 @@ def login(creds: LoginRequest, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == username).first()
     if user and user.is_active and verify_password(creds.password, user.password_hash):
         clear_login_rate_limit(client_id, username)
-        user.last_login_at = datetime.utcnow()
+        user.last_login_at = utc_now()
         db.commit()
         access_token, expires_in = create_access_token(user.id, user.username, user.role.value)
         record_event(

@@ -8,7 +8,7 @@
 ![Facebook Webhook](https://img.shields.io/badge/Facebook-Webhook-1877F2?logo=facebook&logoColor=white)
 ![AI Reply](https://img.shields.io/badge/AI-Comment%20%26%20Inbox-111827)
 
-Hệ thống tự động hóa vận hành Facebook Page theo hướng "một dashboard để quản lý tất cả": crawl video từ TikTok, tạo chiến dịch, xếp lịch đăng Facebook Reels, sinh caption bằng AI, trả lời bình luận tự động, trả lời inbox tự động, theo dõi worker/task queue, cấu hình runtime ngay trên giao diện, và quản lý người dùng theo vai trò.
+Hệ thống tự động hóa vận hành Facebook Page theo hướng "một dashboard để quản lý tất cả": crawl video từ TikTok và YouTube Shorts, tạo chiến dịch, xếp lịch đăng Facebook Reels, sinh caption bằng AI, trả lời bình luận tự động, trả lời inbox tự động, theo dõi worker/task queue, cấu hình runtime ngay trên giao diện, và quản lý người dùng theo vai trò.
 
 README này được viết lại theo đúng trạng thái hiện tại của mã nguồn trong repo, không phải mô tả ý tưởng cũ.
 
@@ -52,7 +52,7 @@ Tài liệu này ưu tiên 2 nhóm người đọc:
 
 Mục tiêu chính:
 
-- lấy video từ TikTok theo campaign
+- lấy video từ TikTok hoặc YouTube Shorts theo campaign
 - tạo hàng chờ video để đăng lên Facebook Reels
 - dùng AI để sinh hoặc hỗ trợ caption
 - phản hồi bình luận Facebook tự động
@@ -79,6 +79,7 @@ Hiện tại repo đã có đầy đủ các phần sau:
 - `inbox schedule` và `cooldown` theo fanpage
 - `worker heartbeat`, `system events`, `task monitoring`
 - `runtime settings` được lưu DB và sinh ra `backend/runtime.env`
+- `source resolver` để phân biệt TikTok video/profile/shortlink và YouTube Shorts đơn/feed
 
 ## 3. Kiến trúc tổng thể
 
@@ -122,16 +123,21 @@ flowchart LR
 | `frontend` | `5173` |
 | `db` | `5432` |
 
+Lưu ý:
+
+- bên ngoài host, dashboard vẫn mở ở `http://localhost:5173`
+- bên trong container production, frontend hiện chạy bằng Nginx trên cổng `80`
+
 ## 5. Luồng hoạt động end-to-end
 
 ### Luồng nội dung
 
 1. Quản trị viên đăng nhập dashboard.
 2. Cấu hình fanpage bằng `Page Access Token`.
-3. Tạo campaign từ link TikTok hoặc nguồn crawl.
+3. Tạo campaign từ link TikTok, link YouTube Shorts đơn hoặc feed Shorts.
 4. API tạo task sync campaign.
-5. Worker claim task, dùng `yt-dlp` lấy metadata/video.
-6. Video được lưu vào queue và gắn lịch đăng.
+5. Worker claim task, dùng `yt-dlp` lấy metadata/video từ nền tảng đã nhận diện.
+6. Video được lưu vào queue, gắn `source_platform/source_kind`, rồi xếp lịch đăng.
 7. Khi đến giờ, worker đăng video lên Facebook Reels.
 8. Nếu lỗi, video có thể được retry hoặc xử lý lại.
 
@@ -162,7 +168,7 @@ flowchart LR
 
 ### 6.1. Campaign và video queue
 
-- Tạo campaign từ nguồn TikTok
+- Tạo campaign từ TikTok hoặc YouTube Shorts
 - Crawl video và metadata bằng `yt-dlp`
 - Xếp lịch đăng
 - Pause / resume / delete campaign
@@ -170,6 +176,23 @@ flowchart LR
 - Ưu tiên video trong queue
 - Chỉnh caption trước khi đăng
 - Tách unique video theo `campaign_id + original_id`
+- Hiển thị rõ `source_platform` và `source_kind` trong dashboard
+- Filter chiến dịch và hàng chờ theo nguồn TikTok / YouTube Shorts
+
+### 6.1.1. Nguồn nội dung hiện hỗ trợ
+
+- TikTok video: `https://www.tiktok.com/@creator/video/...`
+- TikTok profile: `https://www.tiktok.com/@creator`
+- TikTok shortlink: `https://vt.tiktok.com/...` hoặc `https://vm.tiktok.com/...`
+- YouTube Shorts đơn: `https://www.youtube.com/shorts/...`
+- YouTube Shorts feed: `https://www.youtube.com/@creator/shorts`
+- YouTube Shorts feed theo channel/user/c: `https://www.youtube.com/channel/.../shorts`, `.../user/.../shorts`, `.../c/.../shorts`
+
+### 6.1.2. Nguồn hiện chưa hỗ trợ
+
+- `https://www.youtube.com/watch?v=...`
+- `https://youtu.be/...`
+- playlist YouTube thường không phải Shorts feed
 
 ### 6.2. Facebook Page config
 
@@ -240,6 +263,9 @@ Giao diện hiện tại được chia khu rõ ràng để đỡ dàn trải:
 
 - trạng thái hệ thống
 - metric quan trọng
+- panel so sánh TikTok vs YouTube Shorts
+- filter nguồn ngay tại overview để xem campaign nóng theo TikTok hoặc Shorts
+- biểu đồ xu hướng 7 ngày cho `sẵn sàng / đã đăng / thất bại` theo từng nguồn
 - runtime config
 - cảnh báo cấu hình
 
@@ -247,12 +273,16 @@ Giao diện hiện tại được chia khu rõ ràng để đỡ dàn trải:
 
 - danh sách campaign
 - tạo campaign mới
+- nhận diện nguồn TikTok / YouTube Shorts ngay trong form
+- filter campaign theo nguồn
 - trạng thái sync
 - thao tác pause/resume/delete
 
 ### `Lịch đăng`
 
 - video queue
+- filter video theo trạng thái, chiến dịch và nguồn nội dung
+- thống kê nhanh số video sẵn sàng từ TikTok và YouTube Shorts
 - trạng thái từng video
 - caption
 - retry / ưu tiên / chỉnh sửa
@@ -448,6 +478,13 @@ Các biến dưới đây vẫn nên được quản lý ở tầng triển khai
 | `SCHEDULER_ENABLED` | bật/tắt scheduler |
 | `APP_ROLE` | `api` hoặc `worker` |
 | `BACKGROUND_JOBS_MODE` | chế độ xử lý job nền |
+| `TASK_RETRY_BASE_SECONDS` | thời gian retry nền tảng cho task queue |
+| `TASK_RETRY_MAX_SECONDS` | trần backoff cho task queue |
+| `TASK_LOCK_STALE_SECONDS` | ngưỡng coi task `processing` là bị kẹt |
+| `EXTERNAL_HTTP_TIMEOUT` | timeout chuẩn cho call ra ngoài |
+| `HTTP_RETRY_ATTEMPTS` | số lần retry cho Facebook/Gemini probe và API call |
+| `HTTP_RETRY_BASE_SECONDS` | backoff nền tảng cho external HTTP |
+| `HTTP_RETRY_MAX_SECONDS` | trần backoff cho external HTTP |
 | `LOG_LEVEL` | mức log |
 
 ## 13. Thiết lập Facebook Page và webhook
@@ -707,6 +744,109 @@ npm run build
 - nếu worker bị stale, có thể cleanup ngay trên dashboard
 - nếu app Meta còn ở `Development Mode`, tài khoản test phải thuộc vai trò phù hợp
 
+### 20.1. Docker hardening hiện đã bật
+
+`docker-compose.yml` hiện đã được siết thêm cho production nhỏ:
+
+- `restart: unless-stopped` cho toàn bộ service chính để tránh container chết âm thầm
+- `init: true` để dọn zombie process gọn hơn
+- `stop_grace_period` riêng cho `db`, `backend`, `worker`, `frontend`, `tunnel`
+- `healthcheck` cho:
+  - `db` bằng `pg_isready`
+  - `backend` qua `GET /health`
+  - `worker` qua heartbeat thật bằng `python -m app.worker.healthcheck`
+  - `frontend` bằng probe HTTP cục bộ trên Nginx
+- log rotation Docker qua `json-file`:
+  - `max-size=20m`
+  - `max-file=5`
+- env hardening cho retry/timeout:
+  - `TASK_RETRY_BASE_SECONDS`
+  - `TASK_RETRY_MAX_SECONDS`
+  - `TASK_LOCK_STALE_SECONDS`
+  - `EXTERNAL_HTTP_TIMEOUT`
+- `HTTP_RETRY_ATTEMPTS`
+- `HTTP_RETRY_BASE_SECONDS`
+- `HTTP_RETRY_MAX_SECONDS`
+
+### 20.3. Frontend production image
+
+Frontend production hiện đã đổi sang kiểu multi-stage build:
+
+- stage 1: `node:20-alpine` để build `dist/`
+- stage 2: `nginx:alpine` để serve static file
+
+Nginx được cấu hình để:
+
+- serve dashboard tĩnh từ `dist/`
+- proxy `/api` sang `backend:8000`
+- proxy `/downloads` sang `backend:8000/downloads`
+- giữ route SPA bằng `try_files ... /index.html`
+
+Lợi ích:
+
+- runtime nhẹ hơn
+- không cần giữ `node_modules` trong container chạy thật
+- ổn định hơn Vite dev server
+- phù hợp production hơn cho reverse proxy và healthcheck
+
+### 20.2. Checklist rollout production
+
+Đây là checklist ngắn gọn nên chạy theo mỗi lần lên máy thật:
+
+#### Trước khi deploy
+
+- chạy `python -m pytest -q tests`
+- chạy `python -m compileall app alembic`
+- chạy `npm run lint`
+- chạy `npm run build`
+- kiểm tra `JWT_SECRET` và `TOKEN_ENCRYPTION_SECRET` không còn giá trị mặc định
+- kiểm tra `BASE_URL`, `FB_APP_SECRET`, `FB_VERIFY_TOKEN`, `GEMINI_API_KEY`
+- backup PostgreSQL hoặc snapshot volume `database/`
+- chắc chắn migration mới đã sẵn sàng
+
+#### Khi deploy
+
+- pull code mới
+- chạy `docker compose config` để kiểm tra syntax compose
+- chạy `docker compose up -d --build db backend worker frontend`
+- nếu đổi `TUNNEL_TOKEN`, chạy thêm `docker compose up -d --force-recreate tunnel`
+- giữ sẵn cửa sổ log:
+
+```bash
+docker compose logs -f backend worker
+```
+
+#### Sau khi deploy 5-15 phút đầu
+
+- kiểm tra `GET /health`
+- kiểm tra `GET /system/health`
+- vào dashboard xem:
+  - `online_workers`
+  - `task_queue`
+  - `stale_processing_tasks`
+  - `dependencies.facebook_graph`
+  - `dependencies.gemini`
+  - `dependencies.yt_dlp`
+- chạy smoke test thật:
+  - tạo 1 campaign TikTok hoặc YouTube Shorts
+  - sync ra queue
+  - thử 1 comment thật
+  - thử 1 inbox thật
+
+#### Dấu hiệu nên rollback ngay
+
+- `database.ok = false`
+- `worker` không lên heartbeat
+- task bị kẹt `processing` tăng liên tục
+- Facebook webhook không còn nhận event mới
+- Gemini hoặc Graph API lỗi hàng loạt làm queue thất bại tăng nhanh
+
+#### Rollback nhanh
+
+- quay về commit/image trước
+- chạy lại `docker compose up -d --build ...`
+- kiểm tra `system/health` và các smoke flow quan trọng
+
 ## 21. Phân tích hiện trạng
 
 Tính đến hiện tại, dự án đã vượt mức MVP đơn giản và đang ở ngưỡng "nội bộ dùng thật được" với nhiều lớp vận hành hơn:
@@ -801,6 +941,7 @@ Khuyến nghị:
 - đặt reverse proxy phía trước
 - dùng HTTPS public cho `BASE_URL`
 - hạn chế phụ thuộc `tunnel` nếu đã có domain riêng
+- giữ frontend ở dạng static build + Nginx như Dockerfile hiện tại, không chạy Vite dev server ở production
 
 ### Kịch bản 4. Production cứng hơn
 

@@ -1,17 +1,19 @@
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import and_, func, literal, or_
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.time import utc_now, utc_today
 from app.models.models import Campaign, CampaignStatus, FacebookPage, Video, VideoStatus
 from app.services.ai_generator import generate_caption
 from app.services.observability import record_event
+from app.services.source_resolver import SourceResolutionError, resolve_content_source
 from app.services.task_queue import (
     TASK_TYPE_CAMPAIGN_SYNC,
     TASK_TYPE_VIDEO_RETRY,
@@ -84,6 +86,8 @@ def serialize_campaign(campaign: Campaign, summary_map, page_name_map):
         "id": str(campaign.id),
         "name": campaign.name,
         "source_url": campaign.source_url,
+        "source_platform": campaign.source_platform,
+        "source_kind": campaign.source_kind,
         "status": normalize_status(campaign.status),
         "auto_post": campaign.auto_post,
         "target_page_id": campaign.target_page_id,
@@ -116,6 +120,8 @@ def serialize_video(video: Video, page_name_map=None):
         "campaign_id": str(video.campaign_id),
         "campaign_name": campaign_name,
         "campaign_status": campaign_status,
+        "source_platform": video.source_platform or (campaign.source_platform if campaign else None),
+        "source_kind": video.source_kind or (campaign.source_kind if campaign else None),
         "target_page_id": target_page_id,
         "target_page_name": page_name,
         "original_id": video.original_id,
@@ -131,6 +137,96 @@ def serialize_video(video: Video, page_name_map=None):
         "created_at": serialize_datetime(video.created_at),
         "updated_at": serialize_datetime(video.updated_at),
     }
+
+
+def build_source_stats(db: Session):
+    summary = {
+        "tiktok": {"campaigns": 0, "videos": 0, "ready": 0},
+        "youtube": {"campaigns": 0, "videos": 0, "ready": 0},
+        "unknown": {"campaigns": 0, "videos": 0, "ready": 0},
+    }
+
+    campaign_platform = func.coalesce(Campaign.source_platform, literal("unknown"))
+    campaign_rows = (
+        db.query(campaign_platform.label("platform"), func.count(Campaign.id))
+        .group_by(campaign_platform)
+        .all()
+    )
+    for platform, count in campaign_rows:
+        key = platform if platform in summary else "unknown"
+        summary[key]["campaigns"] = count
+
+    video_platform = func.coalesce(Video.source_platform, Campaign.source_platform, literal("unknown"))
+    video_rows = (
+        db.query(video_platform.label("platform"), func.count(Video.id))
+        .outerjoin(Campaign, Video.campaign_id == Campaign.id)
+        .group_by(video_platform)
+        .all()
+    )
+    for platform, count in video_rows:
+        key = platform if platform in summary else "unknown"
+        summary[key]["videos"] = count
+
+    ready_rows = (
+        db.query(video_platform.label("platform"), func.count(Video.id))
+        .outerjoin(Campaign, Video.campaign_id == Campaign.id)
+        .filter(Video.status == VideoStatus.ready)
+        .group_by(video_platform)
+        .all()
+    )
+    for platform, count in ready_rows:
+        key = platform if platform in summary else "unknown"
+        summary[key]["ready"] = count
+
+    return summary
+
+
+def build_source_trends(db: Session, days: int = 7):
+    today = utc_today()
+    labels = [
+        (today - timedelta(days=offset)).isoformat()
+        for offset in reversed(range(days))
+    ]
+    label_index = {label: idx for idx, label in enumerate(labels)}
+    series = {
+        "tiktok": {"ready": [0] * days, "posted": [0] * days, "failed": [0] * days},
+        "youtube": {"ready": [0] * days, "posted": [0] * days, "failed": [0] * days},
+        "unknown": {"ready": [0] * days, "posted": [0] * days, "failed": [0] * days},
+    }
+
+    start_date = today - timedelta(days=days - 1)
+    start_datetime = datetime.combine(start_date, time.min)
+    video_platform = func.coalesce(Video.source_platform, Campaign.source_platform, literal("unknown"))
+    status_specs = {
+        "ready": (VideoStatus.ready, Video.publish_time),
+        "posted": (VideoStatus.posted, Video.updated_at),
+        "failed": (VideoStatus.failed, Video.updated_at),
+    }
+
+    for status_key, (target_status, timestamp_column) in status_specs.items():
+        rows = (
+            db.query(
+                video_platform.label("platform"),
+                func.date(timestamp_column).label("day"),
+                func.count(Video.id),
+            )
+            .outerjoin(Campaign, Video.campaign_id == Campaign.id)
+            .filter(
+                Video.status == target_status,
+                timestamp_column.is_not(None),
+                timestamp_column >= start_datetime,
+            )
+            .group_by(video_platform, func.date(timestamp_column))
+            .all()
+        )
+        for platform, raw_day, count in rows:
+            day_key = raw_day.isoformat() if hasattr(raw_day, "isoformat") else str(raw_day)
+            if day_key not in label_index:
+                continue
+            source_key = platform if platform in series else "unknown"
+            series[source_key][status_key][label_index[day_key]] = count
+
+    return {"labels": labels, "series": series}
 
 
 def get_campaign_or_404(db: Session, campaign_id: str):
@@ -157,8 +253,29 @@ def safe_remove_file(path: str | None):
             pass
 
 
+def ensure_campaign_source_details(campaign: Campaign):
+    resolved = resolve_content_source(campaign.source_url)
+    changed = False
+    if campaign.source_url != resolved.normalized_url:
+        campaign.source_url = resolved.normalized_url
+        changed = True
+    if campaign.source_platform != resolved.platform.value:
+        campaign.source_platform = resolved.platform.value
+        changed = True
+    if campaign.source_kind != resolved.source_kind.value:
+        campaign.source_kind = resolved.source_kind.value
+        changed = True
+    return resolved, changed
+
+
 @router.post("/")
 def create_campaign(campaign_in: CampaignCreate, db: Session = Depends(get_db)):
+    source_candidate = Campaign(source_url=campaign_in.source_url.strip())
+    try:
+        resolved_source, _ = ensure_campaign_source_details(source_candidate)
+    except SourceResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if campaign_in.target_page_id:
         page = db.query(FacebookPage).filter(FacebookPage.page_id == campaign_in.target_page_id).first()
         if not page:
@@ -166,7 +283,9 @@ def create_campaign(campaign_in: CampaignCreate, db: Session = Depends(get_db)):
 
     db_campaign = Campaign(
         name=campaign_in.name.strip(),
-        source_url=campaign_in.source_url.strip(),
+        source_url=resolved_source.normalized_url,
+        source_platform=resolved_source.platform.value,
+        source_kind=resolved_source.source_kind.value,
         auto_post=campaign_in.auto_post,
         target_page_id=campaign_in.target_page_id,
         schedule_interval=campaign_in.schedule_interval,
@@ -182,7 +301,13 @@ def create_campaign(campaign_in: CampaignCreate, db: Session = Depends(get_db)):
         task_type=TASK_TYPE_CAMPAIGN_SYNC,
         entity_type="campaign",
         entity_id=str(db_campaign.id),
-        payload={"campaign_id": str(db_campaign.id), "source_url": db_campaign.source_url, "allow_paused": False},
+        payload={
+            "campaign_id": str(db_campaign.id),
+            "source_url": db_campaign.source_url,
+            "source_platform": db_campaign.source_platform,
+            "source_kind": db_campaign.source_kind,
+            "allow_paused": False,
+        },
         priority=20,
         max_attempts=2,
     )
@@ -211,10 +336,27 @@ def get_campaigns(db: Session = Depends(get_db)):
 @router.post("/{campaign_id}/sync")
 def sync_campaign(campaign_id: str, db: Session = Depends(get_db)):
     campaign = get_campaign_or_404(db, campaign_id)
+    try:
+        _, changed = ensure_campaign_source_details(campaign)
+    except SourceResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     if campaign.last_sync_status == "syncing":
         raise HTTPException(status_code=400, detail="Chiến dịch này đang đồng bộ, chưa thể chạy lại.")
 
     set_campaign_sync_state(campaign, "queued")
+    if changed:
+        record_event(
+            "campaign",
+            "info",
+            "Đã chuẩn hóa nguồn nội dung cho chiến dịch.",
+            db=db,
+            details={
+                "campaign_id": str(campaign.id),
+                "source_platform": campaign.source_platform,
+                "source_kind": campaign.source_kind,
+            },
+        )
     db.commit()
     db.refresh(campaign)
 
@@ -223,7 +365,13 @@ def sync_campaign(campaign_id: str, db: Session = Depends(get_db)):
         task_type=TASK_TYPE_CAMPAIGN_SYNC,
         entity_type="campaign",
         entity_id=str(campaign.id),
-        payload={"campaign_id": str(campaign.id), "source_url": campaign.source_url, "allow_paused": True},
+        payload={
+            "campaign_id": str(campaign.id),
+            "source_url": campaign.source_url,
+            "source_platform": campaign.source_platform,
+            "source_kind": campaign.source_kind,
+            "allow_paused": True,
+        },
         priority=25,
         max_attempts=2,
     )
@@ -315,6 +463,8 @@ def get_video_stats(db: Session = Depends(get_db)):
         "next_publish": serialize_datetime(next_publish),
         "queue_end": serialize_datetime(queue_end),
         "last_posted": serialize_datetime(last_posted),
+        "by_source": build_source_stats(db),
+        "source_trends": build_source_trends(db),
     }
 
 
@@ -324,6 +474,7 @@ def get_videos(
     limit: int = 10,
     status: str | None = None,
     campaign_id: str | None = None,
+    source_platform: str | None = None,
     db: Session = Depends(get_db),
 ):
     if page < 1 or limit < 1:
@@ -339,6 +490,22 @@ def get_videos(
 
     if campaign_id and campaign_id != "all":
         query = query.filter(Video.campaign_id == parse_uuid_or_400(campaign_id, "Mã chiến dịch"))
+
+    if source_platform and source_platform != "all":
+        allowed_platforms = {"tiktok", "youtube", "unknown"}
+        if source_platform not in allowed_platforms:
+            raise HTTPException(status_code=400, detail="Bộ lọc nguồn nội dung không hợp lệ.")
+
+        query = query.outerjoin(Campaign, Video.campaign_id == Campaign.id)
+        if source_platform == "unknown":
+            query = query.filter(Video.source_platform.is_(None), Campaign.source_platform.is_(None))
+        else:
+            query = query.filter(
+                or_(
+                    Video.source_platform == source_platform,
+                    and_(Video.source_platform.is_(None), Campaign.source_platform == source_platform),
+                )
+            )
 
     total = query.count()
     offset = (page - 1) * limit
@@ -378,7 +545,7 @@ def prioritize_video(video_id: str, db: Session = Depends(get_db)):
         .scalar()
     )
 
-    now = datetime.utcnow()
+    now = utc_now()
     video.publish_time = min(now, earliest_other_publish - timedelta(seconds=1)) if earliest_other_publish else now
     video.last_error = None
     db.commit()
@@ -433,7 +600,7 @@ def retry_video(video_id: str, db: Session = Depends(get_db)):
 
     if video.file_path and os.path.exists(video.file_path):
         video.status = VideoStatus.ready
-        video.publish_time = datetime.utcnow()
+        video.publish_time = utc_now()
         video.last_error = None
         video.fb_post_id = None
         db.commit()

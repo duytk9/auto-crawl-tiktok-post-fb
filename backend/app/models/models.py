@@ -1,12 +1,12 @@
 import enum
 import uuid
-from datetime import datetime
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Enum, ForeignKey, Integer, String, UniqueConstraint, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+from app.core.time import utc_now
 
 JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
@@ -31,6 +31,12 @@ class InteractionStatus(str, enum.Enum):
     ignored = "ignored"
 
 
+class ConversationStatus(str, enum.Enum):
+    ai_active = "ai_active"
+    operator_active = "operator_active"
+    resolved = "resolved"
+
+
 class TaskStatus(str, enum.Enum):
     queued = "queued"
     processing = "processing"
@@ -49,6 +55,8 @@ class Campaign(Base):
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = Column(String, index=True)
     source_url = Column(String)
+    source_platform = Column(String, nullable=True, index=True)
+    source_kind = Column(String, nullable=True)
     status = Column(Enum(CampaignStatus), default=CampaignStatus.active)
     auto_post = Column(Boolean, default=False)
     target_page_id = Column(String, nullable=True)
@@ -56,8 +64,8 @@ class Campaign(Base):
     last_synced_at = Column(DateTime, nullable=True)
     last_sync_status = Column(String, default="idle")
     last_sync_error = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     videos = relationship("Video", back_populates="campaign")
 
@@ -71,6 +79,8 @@ class Video(Base):
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     campaign_id = Column(Uuid(as_uuid=True), ForeignKey("campaigns.id"))
     original_id = Column(String, index=True)
+    source_platform = Column(String, nullable=True, index=True)
+    source_kind = Column(String, nullable=True)
     source_video_url = Column(String, nullable=True)
     file_path = Column(String, nullable=True)
     original_caption = Column(String, nullable=True)
@@ -80,8 +90,8 @@ class Video(Base):
     fb_post_id = Column(String, nullable=True)
     last_error = Column(String, nullable=True)
     retry_count = Column(Integer, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
     campaign = relationship("Campaign", back_populates="videos")
 
@@ -101,8 +111,36 @@ class FacebookPage(Base):
     message_reply_start_time = Column(String, default="08:00", nullable=False)
     message_reply_end_time = Column(String, default="22:00", nullable=False)
     message_reply_cooldown_minutes = Column(Integer, default=0, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class InboxConversation(Base):
+    __tablename__ = "inbox_conversations"
+    __table_args__ = (
+        UniqueConstraint("page_id", "sender_id", name="uq_inbox_conversations_page_sender"),
+    )
+
+    id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    page_id = Column(String, ForeignKey("facebook_pages.page_id"), index=True)
+    sender_id = Column(String, index=True, nullable=False)
+    recipient_id = Column(String, nullable=True)
+    status = Column(Enum(ConversationStatus), default=ConversationStatus.ai_active, nullable=False, index=True)
+    conversation_summary = Column(String, nullable=True)
+    current_intent = Column(String, nullable=True)
+    customer_facts = Column(JSON_TYPE, nullable=True)
+    needs_human_handoff = Column(Boolean, default=False, nullable=False)
+    handoff_reason = Column(String, nullable=True)
+    assigned_to_user_id = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
+    internal_note = Column(String, nullable=True)
+    latest_customer_message_id = Column(String, nullable=True)
+    latest_reply_message_id = Column(String, nullable=True)
+    last_customer_message_at = Column(DateTime, nullable=True)
+    last_ai_reply_at = Column(DateTime, nullable=True)
+    last_operator_reply_at = Column(DateTime, nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class InteractionLog(Base):
@@ -116,8 +154,8 @@ class InteractionLog(Base):
     user_message = Column(String)
     ai_reply = Column(String, nullable=True)
     status = Column(Enum(InteractionStatus), default=InteractionStatus.pending)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class InboxMessageLog(Base):
@@ -125,16 +163,19 @@ class InboxMessageLog(Base):
 
     id = Column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
     page_id = Column(String, ForeignKey("facebook_pages.page_id"), index=True)
+    conversation_id = Column(Uuid(as_uuid=True), ForeignKey("inbox_conversations.id"), nullable=True, index=True)
     facebook_message_id = Column(String, unique=True, index=True)
     sender_id = Column(String, index=True)
     recipient_id = Column(String, nullable=True)
     user_message = Column(String)
     ai_reply = Column(String, nullable=True)
     facebook_reply_message_id = Column(String, nullable=True)
+    reply_source = Column(String, nullable=True)
+    reply_author_user_id = Column(Uuid(as_uuid=True), ForeignKey("users.id"), nullable=True, index=True)
     status = Column(Enum(InteractionStatus), default=InteractionStatus.pending)
     last_error = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class TaskQueue(Base):
@@ -150,13 +191,13 @@ class TaskQueue(Base):
     attempts = Column(Integer, default=0)
     max_attempts = Column(Integer, default=3)
     last_error = Column(String, nullable=True)
-    available_at = Column(DateTime, default=datetime.utcnow)
+    available_at = Column(DateTime, default=utc_now)
     locked_at = Column(DateTime, nullable=True)
     locked_by = Column(String, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class User(Base):
@@ -170,8 +211,8 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     must_change_password = Column(Boolean, default=False, nullable=False)
     last_login_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class WorkerHeartbeat(Base):
@@ -185,9 +226,9 @@ class WorkerHeartbeat(Base):
     current_task_id = Column(String, nullable=True)
     current_task_type = Column(String, nullable=True)
     details = Column(JSON_TYPE, nullable=True)
-    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=utc_now, nullable=False)
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 
 class SystemEvent(Base):
@@ -199,7 +240,7 @@ class SystemEvent(Base):
     message = Column(String, nullable=False)
     details = Column(JSON_TYPE, nullable=True)
     actor_user_id = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=utc_now, index=True)
 
 
 class RuntimeSetting(Base):
@@ -209,5 +250,5 @@ class RuntimeSetting(Base):
     value = Column(String, nullable=True)
     is_secret = Column(Boolean, default=False, nullable=False)
     updated_by_user_id = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)

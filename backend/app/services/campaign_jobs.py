@@ -8,21 +8,32 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
+from app.core.time import utc_now
 from app.models.models import (
     Campaign,
     CampaignStatus,
+    ConversationStatus,
     FacebookPage,
+    InboxConversation,
     InboxMessageLog,
     InteractionLog,
     InteractionStatus,
     Video,
     VideoStatus,
 )
-from app.services.ai_generator import generate_reply
+from app.services.ai_generator import generate_message_reply_with_context, generate_reply
 from app.services.fb_graph import reply_to_comment, send_page_message
+from app.services.inbox_memory import (
+    apply_conversation_ai_state,
+    get_or_create_inbox_conversation,
+    normalize_customer_facts,
+    serialize_recent_turns,
+    touch_conversation_with_customer_message,
+)
 from app.services.observability import record_event
 from app.services.security import decrypt_secret
-from app.services.ytdlp_crawler import download_video, extract_metadata
+from app.services.source_resolver import SourceResolutionError, resolve_content_source
+from app.services.ytdlp_crawler import download_video, extract_source_entries
 
 
 def parse_uuid_or_none(raw_id: str):
@@ -53,8 +64,31 @@ def set_campaign_sync_state(campaign: Campaign, status: str, error: str | None =
         campaign.last_synced_at = finished_at
 
 
+def ensure_campaign_source_details(campaign: Campaign):
+    resolved = resolve_content_source(campaign.source_url)
+    changed = False
+    if campaign.source_url != resolved.normalized_url:
+        campaign.source_url = resolved.normalized_url
+        changed = True
+    if campaign.source_platform != resolved.platform.value:
+        campaign.source_platform = resolved.platform.value
+        changed = True
+    if campaign.source_kind != resolved.source_kind.value:
+        campaign.source_kind = resolved.source_kind.value
+        changed = True
+    return resolved, changed
+
+
+def build_download_prefix(source_platform: str | None) -> str:
+    if source_platform == "youtube":
+        return "youtube_short"
+    if source_platform == "tiktok":
+        return "tiktok"
+    return "video"
+
+
 def build_source_page_publish_time(db: Session, page_id: str | None, schedule_interval: int):
-    now = datetime.utcnow()
+    now = utc_now()
     start_time = now
 
     if page_id and schedule_interval > 0:
@@ -85,12 +119,12 @@ def retry_video_download(video_id: str) -> dict:
         if not video:
             raise ValueError("Không tìm thấy video cần thử lại.")
 
-        out_path, _ = download_video(video.source_video_url, "tiktok")
+        out_path, _ = download_video(video.source_video_url, build_download_prefix(video.source_platform))
         if out_path:
             safe_remove_file(video.file_path)
             video.file_path = out_path
             video.status = VideoStatus.ready
-            video.publish_time = datetime.utcnow()
+            video.publish_time = utc_now()
             video.last_error = None
             db.commit()
             record_event(
@@ -128,7 +162,13 @@ def retry_video_download(video_id: str) -> dict:
         db.close()
 
 
-def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool = False) -> dict:
+def sync_campaign_content(
+    campaign_id: str,
+    source_url: str,
+    allow_paused: bool = False,
+    source_platform: str | None = None,
+    source_kind: str | None = None,
+) -> dict:
     db: Session = SessionLocal()
     try:
         campaign_uuid = parse_uuid_or_none(campaign_id)
@@ -138,6 +178,22 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
         campaign = db.query(Campaign).filter(Campaign.id == campaign_uuid).first()
         if not campaign:
             raise ValueError("Không tìm thấy chiến dịch cần đồng bộ.")
+        try:
+            resolved_source, changed = ensure_campaign_source_details(campaign)
+        except SourceResolutionError as exc:
+            raise ValueError(str(exc)) from exc
+
+        if not campaign.source_platform and source_platform:
+            campaign.source_platform = source_platform
+            changed = True
+        if not campaign.source_kind and source_kind:
+            campaign.source_kind = source_kind
+            changed = True
+        if not campaign.source_url and source_url:
+            campaign.source_url = source_url
+            changed = True
+        db.commit()
+        db.refresh(campaign)
 
         set_campaign_sync_state(campaign, "syncing")
         db.commit()
@@ -149,9 +205,17 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
             details={"campaign_id": campaign_id, "campaign_name": campaign.name},
         )
 
-        info = extract_metadata(source_url)
-        entries = info.get("entries", [info]) if "entries" in info else [info]
-        entries = list(reversed(entries))
+        entries = list(
+            reversed(
+                extract_source_entries(
+                    campaign.source_url,
+                    campaign.source_platform or resolved_source.platform.value,
+                    campaign.source_kind or resolved_source.source_kind.value,
+                )
+            )
+        )
+        if not entries:
+            raise ValueError("Nguồn nội dung không trả về video hợp lệ để đưa vào hàng chờ.")
 
         start_time = build_source_page_publish_time(
             db,
@@ -171,11 +235,8 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
                 interrupted_reason = "Chiến dịch đã bị tạm dừng trong lúc đồng bộ."
                 break
 
-            video_url = entry.get("webpage_url", entry.get("url"))
-            if not video_url:
-                continue
-
-            original_id = entry.get("id", str(uuid.uuid4()))
+            video_url = entry.source_video_url
+            original_id = entry.original_id
             existing_vid = (
                 db.query(Video)
                 .filter(Video.campaign_id == campaign_uuid, Video.original_id == original_id)
@@ -185,15 +246,14 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
                 continue
 
             publish_time = start_time + timedelta(minutes=added_count * (campaign.schedule_interval or 0))
-            title = (entry.get("title") or "").strip()
-            description = (entry.get("description") or "").strip()
-            original_caption = description if description else title
 
             db_video = Video(
                 campaign_id=campaign_uuid,
                 original_id=original_id,
+                source_platform=entry.source_platform,
+                source_kind=entry.source_kind,
                 source_video_url=video_url,
-                original_caption=original_caption,
+                original_caption=entry.original_caption,
                 status=VideoStatus.downloading,
                 publish_time=publish_time,
             )
@@ -202,7 +262,7 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
             db.refresh(db_video)
             added_count += 1
 
-            out_path, _ = download_video(video_url, "tiktok")
+            out_path, _ = download_video(video_url, build_download_prefix(entry.source_platform))
             if out_path:
                 db_video.file_path = out_path
                 db_video.status = VideoStatus.ready
@@ -214,7 +274,7 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
         campaign = db.query(Campaign).filter(Campaign.id == campaign_uuid).first()
         if campaign:
             if interrupted_reason:
-                set_campaign_sync_state(campaign, "failed", interrupted_reason, datetime.utcnow())
+                set_campaign_sync_state(campaign, "failed", interrupted_reason, utc_now())
                 record_event(
                     "campaign",
                     "warning",
@@ -223,7 +283,7 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
                     details={"campaign_id": campaign_id, "reason": interrupted_reason},
                 )
             else:
-                set_campaign_sync_state(campaign, "completed", None, datetime.utcnow())
+                set_campaign_sync_state(campaign, "completed", None, utc_now())
                 record_event(
                     "campaign",
                     "info",
@@ -239,7 +299,7 @@ def sync_campaign_content(campaign_id: str, source_url: str, allow_paused: bool 
         if campaign_uuid:
             campaign = db.query(Campaign).filter(Campaign.id == campaign_uuid).first()
             if campaign:
-                set_campaign_sync_state(campaign, "failed", str(exc), datetime.utcnow())
+                set_campaign_sync_state(campaign, "failed", str(exc), utc_now())
                 db.commit()
         record_event(
             "campaign",
@@ -331,6 +391,27 @@ def reply_to_message_job(message_log_id: str) -> dict:
         if not log:
             raise ValueError("Không tìm thấy tin nhắn inbox cần phản hồi.")
 
+        conversation = None
+        if log.conversation_id:
+            conversation = db.query(InboxConversation).filter(InboxConversation.id == log.conversation_id).first()
+        if not conversation:
+            conversation = get_or_create_inbox_conversation(
+                db,
+                page_id=log.page_id,
+                sender_id=log.sender_id,
+                recipient_id=log.recipient_id,
+            )
+            log.conversation_id = conversation.id
+            db.commit()
+            db.refresh(log)
+
+        if conversation.status != ConversationStatus.ai_active or conversation.needs_human_handoff:
+            log.status = InteractionStatus.ignored
+            log.ai_reply = "Cuộc trò chuyện này đang được chuyển cho nhân viên hỗ trợ."
+            log.last_error = None
+            db.commit()
+            return {"ok": False, "ignored": True, "log_id": message_log_id}
+
         page_config = db.query(FacebookPage).filter(FacebookPage.page_id == log.page_id).first()
         if not page_config or not page_config.long_lived_access_token:
             log.status = InteractionStatus.failed
@@ -347,18 +428,46 @@ def reply_to_message_job(message_log_id: str) -> dict:
             return {"ok": False, "ignored": True, "log_id": message_log_id}
 
         access_token = decrypt_secret(page_config.long_lived_access_token)
-        ai_reply = generate_reply(
-            log.user_message,
-            channel="message",
-            prompt_override=page_config.message_ai_prompt,
+        recent_turns = serialize_recent_turns(
+            db,
+            conversation_id=conversation.id,
+            page_id=log.page_id,
+            sender_id=log.sender_id,
+            exclude_log_id=log.id,
         )
+        ai_payload = generate_message_reply_with_context(
+            log.user_message,
+            prompt_override=page_config.message_ai_prompt,
+            conversation_summary=conversation.conversation_summary,
+            recent_turns=recent_turns,
+            customer_facts=normalize_customer_facts(conversation.customer_facts),
+        )
+        ai_reply = ai_payload["reply"]
         log.ai_reply = ai_reply
+        touch_conversation_with_customer_message(
+            conversation,
+            message_id=log.facebook_message_id,
+            recipient_id=log.recipient_id,
+            message_time=log.created_at or utc_now(),
+        )
+        apply_conversation_ai_state(
+            conversation,
+            summary=ai_payload.get("summary"),
+            intent=ai_payload.get("intent"),
+            customer_facts=ai_payload.get("customer_facts"),
+            handoff=bool(ai_payload.get("handoff")),
+            handoff_reason=ai_payload.get("handoff_reason"),
+        )
+        db.commit()
 
         res = send_page_message(log.sender_id, ai_reply, access_token)
         if res and ("message_id" in res or "recipient_id" in res):
             log.status = InteractionStatus.replied
             log.facebook_reply_message_id = res.get("message_id")
+            log.reply_source = "ai"
             log.last_error = None
+            conversation.latest_reply_message_id = log.facebook_reply_message_id
+            conversation.last_ai_reply_at = utc_now()
             record_event(
                 "webhook",
                 "info",
@@ -378,6 +487,8 @@ def reply_to_message_job(message_log_id: str) -> dict:
                     "page_id": log.page_id,
                     "sender_id": log.sender_id,
                     "message_id": log.facebook_message_id,
+                    "conversation_id": str(conversation.id),
+                    "handoff": conversation.needs_human_handoff,
                     "response": res,
                 },
             )

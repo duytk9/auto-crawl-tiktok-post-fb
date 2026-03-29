@@ -24,6 +24,8 @@ def _run_task(task) -> dict:
             payload.get("campaign_id", task.entity_id or ""),
             payload.get("source_url", ""),
             bool(payload.get("allow_paused")),
+            payload.get("source_platform"),
+            payload.get("source_kind"),
         )
     if task.task_type == TASK_TYPE_VIDEO_RETRY:
         return retry_video_download(payload.get("video_id", task.entity_id or ""))
