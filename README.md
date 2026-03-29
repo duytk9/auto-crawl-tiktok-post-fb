@@ -1,107 +1,144 @@
-# Hệ Thống Tự Động Nội Dung Từ TikTok Sang Facebook
+# Social Tool
 
-Hệ thống tự động lấy video từ TikTok, sinh chú thích bằng Gemini, xếp lịch và đăng lên trang Facebook, kèm bảng điều khiển quản trị để theo dõi hàng chờ, chiến dịch, trang Facebook, webhook bình luận và lỗi vận hành.
+Hệ thống tự động lấy nội dung từ TikTok, sinh caption bằng AI, xếp lịch và đăng lên Facebook Page, kèm dashboard quản trị để theo dõi chiến dịch, hàng chờ, worker, webhook và cấu hình runtime.
 
-## Kiến trúc hiện tại
+## Tổng quan
 
-- `backend` chạy FastAPI API.
-- `worker` chạy bộ lập lịch riêng để tránh trùng tác vụ khi mở rộng API.
-- `frontend` là bảng điều khiển React/Vite.
-- PostgreSQL lưu chiến dịch, video, trang Facebook và nhật ký tương tác.
-- Hàng đợi `TaskQueue` chạy bằng worker riêng để xử lý đồng bộ chiến dịch, thử tải lại video và phản hồi bình luận.
-- Alembic quản lý migration schema.
-
-## 🛠 Tech Stack
-
-- **Backend:** FastAPI, Python 3.10+
-- **Worker:** Custom task queue polling system
-- **Frontend:** React, Vite, Tailwind CSS
-- **Database:** PostgreSQL
-- **AI:** Google Gemini Pro API for caption generation and comment replies
-- **Tools:** yt-dlp, Docker, Cloudflare Tunnel
+- `backend`: FastAPI API cho auth, campaign, Facebook, webhook, health và runtime config
+- `worker`: tiến trình nền riêng để chạy task queue, lịch đăng và xử lý reply comment
+- `frontend`: dashboard React/Vite/Tailwind cho vận hành hằng ngày
+- `db`: PostgreSQL lưu chiến dịch, video, user, task queue, log và runtime settings
+- `tunnel`: Cloudflare Tunnel, chỉ cần khi bạn muốn public webhook ra Internet
 
 ## Tính năng chính
 
-- Quét video TikTok bằng `yt-dlp`.
-- Sinh và chỉnh sửa AI caption trước khi đăng.
-- Tự động đăng Facebook Reels theo lịch.
-- Hàng đợi tác vụ nền thật, có theo dõi trạng thái, số lần thử lại và worker đang nhận việc.
-- Thử lại video lỗi, đẩy video lên đầu hàng chờ.
-- Tạm dừng, kích hoạt lại, xóa và đồng bộ lại chiến dịch.
-- Kiểm tra mã truy cập trang Facebook trực tiếp từ bảng điều khiển.
-- Xác minh chữ ký webhook Facebook khi có `FB_APP_SECRET`.
-- Mã hóa mã truy cập trang Facebook trước khi lưu DB.
-- Đăng nhập theo người dùng thật, có vai trò quản trị/vận hành, đổi mật khẩu và đặt lại mật khẩu tạm.
-- Dashboard hiển thị sức khỏe hệ thống, worker, hàng đợi và nhật ký sự kiện gần nhất.
+- Crawl video TikTok bằng `yt-dlp`
+- Sinh caption AI và chỉnh tay trước khi đăng
+- Lập lịch đăng Facebook Reels theo campaign
+- Retry video lỗi, ưu tiên video, pause/resume/delete campaign
+- Task queue riêng cho sync campaign, retry video và reply comment
+- Dashboard theo dõi worker, task, sự kiện hệ thống và bình luận gần nhất
+- Quản lý user theo vai trò `admin` và `operator`
+- Cấu hình runtime ngay trên dashboard thay vì sửa hard-code trong repo
 
-## Chạy nhanh với Docker
+## Runtime Config Trên Dashboard
 
-1. Sao chép biến môi trường mẫu:
+Từ bản hiện tại, các giá trị sau có thể cấu hình trực tiếp trong dashboard admin:
 
-```bash
-cp .env.example .env
-```
+- `BASE_URL`
+- `FB_VERIFY_TOKEN`
+- `FB_APP_SECRET`
+- `GEMINI_API_KEY`
+- `TUNNEL_TOKEN`
 
-2. Điền các giá trị quan trọng trong `.env` hoặc ngay trong `docker-compose.yml`:
+Hệ thống sẽ:
 
-```env
-GEMINI_API_KEY=
-ADMIN_PASSWORD=admin123
-DEFAULT_ADMIN_USERNAME=admin
-DEFAULT_ADMIN_DISPLAY_NAME=Quản trị viên
-BASE_URL=https://your-public-domain.example.com
-JWT_SECRET=change-me
-TOKEN_ENCRYPTION_SECRET=change-me
-FB_VERIFY_TOKEN=change-me
-FB_APP_SECRET=
-TUNNEL_TOKEN=
-TASK_QUEUE_POLL_SECONDS=5
-WORKER_STALE_SECONDS=30
-WORKER_BATCH_SIZE=3
-```
+- lưu override trong database
+- mã hóa secret khi lưu
+- tự sinh file `backend/runtime.env`
+- dùng lại các giá trị này cho webhook, overview/health và worker
 
-3. Khởi động toàn bộ hệ thống:
+Lưu ý:
+
+- `BASE_URL`, `FB_VERIFY_TOKEN`, `FB_APP_SECRET`, `GEMINI_API_KEY` áp dụng ngay sau khi lưu
+- `TUNNEL_TOKEN` cần restart service `tunnel` để Cloudflare đọc token mới
+- `JWT_SECRET`, `TOKEN_ENCRYPTION_SECRET`, `DATABASE_URL` và bootstrap admin vẫn nên giữ ở cấu hình triển khai
+
+## Chạy Nhanh Với Docker
+
+### 1. Khởi động các service chính
 
 ```bash
-docker compose up -d --build
+docker compose up -d --build db backend worker frontend
 ```
 
-## Truy cập
+### 2. Đăng nhập dashboard
 
-- Giao diện quản trị: `http://localhost:5173`
-- Tài liệu API backend: `http://localhost:8000/docs`
-- PostgreSQL: `localhost:5432`
+- Dashboard: [http://localhost:5173](http://localhost:5173)
+- API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
+- Tài khoản mặc định lần đầu:
+  - username: `admin`
+  - password: `admin123`
 
-## Lưu ý vận hành
+Sau lần đăng nhập đầu tiên, nên đổi mật khẩu ngay.
 
-- Đổi ngay `JWT_SECRET` và `TOKEN_ENCRYPTION_SECRET` trước khi dùng thật.
-- `BASE_URL` phải là HTTPS public nếu muốn Facebook webhook hoạt động ổn định.
-- `backend` mặc định không chạy bộ lập lịch nhúng nữa; tác vụ nền do service `worker` đảm nhiệm.
-- Tài khoản mặc định ban đầu là `admin` với mật khẩu `admin123` nếu DB chưa có người dùng nào.
-- Sau lần đăng nhập đầu tiên, nên đổi ngay mật khẩu tài khoản quản trị trong giao diện.
-- Schema được cập nhật qua Alembic khi container backend/worker khởi động.
+### 3. Cấu hình ngay trên trang
 
-## Cấu trúc thư mục
+Vào dashboard, mở khu `Tổng quan` và điền:
+
+- `BASE_URL`
+- `FB_VERIFY_TOKEN`
+- `FB_APP_SECRET`
+- `GEMINI_API_KEY`
+- `TUNNEL_TOKEN` nếu dùng Cloudflare Tunnel
+
+### 4. Nếu dùng Cloudflare Tunnel
+
+Sau khi lưu `TUNNEL_TOKEN` trên dashboard:
+
+```bash
+docker compose up -d --force-recreate tunnel
+```
+
+Nếu chưa cần public webhook, bạn có thể bỏ qua service `tunnel`.
+
+## Cấu Hình Triển Khai
+
+Các biến dưới đây vẫn là cấu hình triển khai, không nên chuyển hết lên UI:
+
+| Biến | Vai trò |
+|------|---------|
+| `DATABASE_URL` | Kết nối PostgreSQL |
+| `JWT_SECRET` | Ký và xác thực access token |
+| `TOKEN_ENCRYPTION_SECRET` | Mã hóa secret lưu trong DB |
+| `ADMIN_PASSWORD` | Bootstrap tài khoản admin lần đầu |
+| `DEFAULT_ADMIN_USERNAME` | Username admin mặc định |
+| `DEFAULT_ADMIN_DISPLAY_NAME` | Tên hiển thị admin mặc định |
+
+## Luồng Hoạt Động
+
+1. Tạo campaign từ dashboard
+2. Worker đưa job sync vào hàng đợi
+3. Video được crawl và xếp lịch
+4. Caption có thể được AI sinh sẵn hoặc chỉnh tay
+5. Worker đăng video khi đến lịch
+6. Webhook Facebook nhận comment mới và đưa vào queue phản hồi
+7. Dashboard hiển thị trạng thái task, worker và sự kiện gần nhất
+
+## Cấu Trúc Thư Mục
 
 ```text
 .
-├── backend/            # FastAPI, Alembic, worker, services
-├── frontend/           # React cho bảng điều khiển
-├── database/           # dữ liệu PostgreSQL
-├── videos_storage/     # video tải tạm trước khi đăng
-├── .env.example        # biến môi trường mẫu
-└── docker-compose.yml  # điều phối API + worker + frontend + db + tunnel
+├── backend/              # API, worker, alembic, services
+├── frontend/             # Dashboard React/Vite
+├── database/             # Dữ liệu PostgreSQL local
+├── videos_storage/       # Video tải tạm
+├── docker-compose.yml    # Toàn bộ stack local
+└── README.md
 ```
 
-## 🤝 Contributing
+## Ghi Chú Vận Hành
 
-Feel free to open issues or submit pull requests for any improvements.
+- `backend` và `worker` tự chạy Alembic khi container khởi động
+- `backend/runtime.env` được sinh ra để cấp lại config cho container khi restart
+- webhook Facebook cần `BASE_URL` là HTTPS public
+- nếu worker stale, có thể dọn trực tiếp từ dashboard
+- nếu đổi `TUNNEL_TOKEN`, nhớ recreate service `tunnel`
 
-## Give me a coffee!!
+## Kiểm Tra Chất Lượng
 
-<img width="130" height="166" alt="image" src="https://github.com/user-attachments/assets/a3909d0a-b2ba-4dce-8064-2bc435beaa22" />
----
+Các lệnh đang dùng trong repo:
 
-*Developed for automated social media management workflows.*
-=======
->>>>>>> 6369e34 (Enhance social automation: AI comment replies, dashboard UI fix, and auth system)
+```bash
+# backend
+python -m compileall app alembic
+python -m pytest -q
+
+# frontend
+npm run lint
+npm run build
+```
+
+## Contributing
+
+Có thể mở issue hoặc pull request nếu bạn muốn mở rộng tính năng hay cải thiện luồng vận hành.
