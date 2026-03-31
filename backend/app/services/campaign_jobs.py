@@ -22,6 +22,7 @@ from app.models.models import (
     VideoStatus,
 )
 from app.services.ai_generator import generate_message_reply_with_context, generate_reply
+from app.services.campaign_management import ensure_campaign_source_details, safe_remove_file, set_campaign_sync_state
 from app.services.fb_graph import reply_to_comment, send_page_message
 from app.services.inbox_memory import (
     apply_conversation_ai_state,
@@ -43,40 +44,10 @@ def parse_uuid_or_none(raw_id: str):
         return None
 
 
-def safe_remove_file(path: str | None):
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
 def mark_video_failed(video: Video, message: str):
     video.status = VideoStatus.failed
     video.last_error = message[:1000]
     video.retry_count = (video.retry_count or 0) + 1
-
-
-def set_campaign_sync_state(campaign: Campaign, status: str, error: str | None = None, finished_at: datetime | None = None):
-    campaign.last_sync_status = status
-    campaign.last_sync_error = error[:1000] if error else None
-    if finished_at:
-        campaign.last_synced_at = finished_at
-
-
-def ensure_campaign_source_details(campaign: Campaign):
-    resolved = resolve_content_source(campaign.source_url)
-    changed = False
-    if campaign.source_url != resolved.normalized_url:
-        campaign.source_url = resolved.normalized_url
-        changed = True
-    if campaign.source_platform != resolved.platform.value:
-        campaign.source_platform = resolved.platform.value
-        changed = True
-    if campaign.source_kind != resolved.source_kind.value:
-        campaign.source_kind = resolved.source_kind.value
-        changed = True
-    return resolved, changed
 
 
 def build_download_prefix(source_platform: str | None) -> str:

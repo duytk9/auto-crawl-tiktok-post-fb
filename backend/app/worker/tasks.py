@@ -4,36 +4,13 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.services.campaign_jobs import reply_to_comment_job, reply_to_message_job, retry_video_download, sync_campaign_content
 from app.services.observability import record_event, update_worker_heartbeat
 from app.services.task_queue import (
-    TASK_TYPE_CAMPAIGN_SYNC,
-    TASK_TYPE_COMMENT_REPLY,
-    TASK_TYPE_MESSAGE_REPLY,
-    TASK_TYPE_VIDEO_RETRY,
     claim_next_task,
     complete_task,
     fail_task,
 )
-
-
-def _run_task(task) -> dict:
-    payload = task.payload or {}
-    if task.task_type == TASK_TYPE_CAMPAIGN_SYNC:
-        return sync_campaign_content(
-            payload.get("campaign_id", task.entity_id or ""),
-            payload.get("source_url", ""),
-            bool(payload.get("allow_paused")),
-            payload.get("source_platform"),
-            payload.get("source_kind"),
-        )
-    if task.task_type == TASK_TYPE_VIDEO_RETRY:
-        return retry_video_download(payload.get("video_id", task.entity_id or ""))
-    if task.task_type == TASK_TYPE_COMMENT_REPLY:
-        return reply_to_comment_job(payload.get("interaction_log_id", task.entity_id or ""))
-    if task.task_type == TASK_TYPE_MESSAGE_REPLY:
-        return reply_to_message_job(payload.get("message_log_id", task.entity_id or ""))
-    raise ValueError(f"Loại tác vụ không được hỗ trợ: {task.task_type}")
+from app.worker.task_registry import run_task
 
 
 def process_task_queue(worker_name: str) -> int:
@@ -63,7 +40,7 @@ def process_task_queue(worker_name: str) -> int:
             )
 
             try:
-                result = _run_task(task)
+                result = run_task(task)
                 complete_task(db, task)
                 record_event(
                     "queue",

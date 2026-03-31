@@ -11,11 +11,12 @@ from app.core.time import utc_now
 from app.models.models import TaskQueue, TaskStatus
 from app.services.http_client import compute_retry_delay
 from app.services.observability import log_structured
-
-TASK_TYPE_CAMPAIGN_SYNC = "campaign_sync"
-TASK_TYPE_VIDEO_RETRY = "video_retry"
-TASK_TYPE_COMMENT_REPLY = "comment_reply"
-TASK_TYPE_MESSAGE_REPLY = "message_reply"
+from app.services.task_types import (
+    TASK_TYPE_CAMPAIGN_SYNC,
+    TASK_TYPE_COMMENT_REPLY,
+    TASK_TYPE_MESSAGE_REPLY,
+    TASK_TYPE_VIDEO_RETRY,
+)
 
 
 def normalize_task_status(value):
