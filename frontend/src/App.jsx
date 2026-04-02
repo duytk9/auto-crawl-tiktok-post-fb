@@ -3,11 +3,7 @@ import {
   Activity,
   AlertTriangle,
   Bot,
-  ChevronDown,
-  ChevronRight,
-  ChevronUp,
   CircleCheck,
-  CircleX,
   Clock,
   CloudDownload,
   Copy,
@@ -26,7 +22,6 @@ import {
   Server,
   Share2,
   ShieldCheck,
-  Terminal,
   Trash2,
   UserPlus,
   X,
@@ -887,37 +882,15 @@ function App() {
   const allDiscoveredSelected = discoveredFbPages.length > 0
     && selectedDiscoveredPageIds.length === discoveredFbPages.length;
 
-  const authFetch = async (url, options = {}) => {
-    if (sessionExpiresAt && new Date(sessionExpiresAt).getTime() <= Date.now()) {
-      setToken(null);
-      setSessionExpiresAt(null);
-      localStorage.removeItem('token');
-      localStorage.removeItem('token_expires_at');
-      throw new Error('Phiên đăng nhập đã hết hạn.');
-    }
-    const headers = { ...options.headers };
-    if (token) headers.Authorization = `Bearer ${token}`;
-    const response = await fetch(url, { ...options, headers });
-    if (response.status === 401) {
-      setToken(null);
-      setSessionExpiresAt(null);
-      localStorage.removeItem('token');
-      localStorage.removeItem('token_expires_at');
-      throw new Error('Phiên đăng nhập đã hết hạn.');
-    }
-    return response;
+  const clearSession = () => {
+    setToken(null);
+    setSessionExpiresAt(null);
+    localStorage.removeItem('token');
+    localStorage.removeItem('token_expires_at');
   };
 
   const requestJson = async (url, options = {}) => {
-    const response = await authFetch(url, options);
-    let payload = null;
-    try {
-      payload = await response.json();
-    } catch {
-      payload = null;
-    }
-    if (!response.ok) throw new Error(parseMessage(payload, 'Yêu cầu không thành công.'));
-    return payload;
+    return requestJsonWithSession(url, token, sessionExpiresAt, clearSession, options);
   };
 
   const setBusy = (key, value) => setActionState((current) => ({ ...current, [key]: value }));
@@ -1645,37 +1618,25 @@ function App() {
   const handleLogin = async (event) => {
     event.preventDefault();
     try {
-      const response = await fetch(`${API_URL}/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: loginUser, password: loginPass }),
-      });
-      const payload = await response.json();
-      if (response.ok) {
-        const expiresAt = payload.expires_in ? new Date(Date.now() + payload.expires_in * 1000).toISOString() : null;
-        setToken(payload.access_token);
-        setSessionExpiresAt(expiresAt);
-        setCurrentUser(payload.user || null);
-        localStorage.setItem('token', payload.access_token);
-        if (expiresAt) localStorage.setItem('token_expires_at', expiresAt);
-        else localStorage.removeItem('token_expires_at');
-        setLoginError('');
-      } else {
-        setLoginError(parseMessage(payload, 'Mật khẩu không chính xác!'));
-      }
-    } catch {
-      setLoginError('Lỗi kết nối server.');
+      const payload = await loginRequest(loginUser, loginPass);
+      const expiresAt = payload.expires_in ? new Date(Date.now() + payload.expires_in * 1000).toISOString() : null;
+      setToken(payload.access_token);
+      setSessionExpiresAt(expiresAt);
+      setCurrentUser(payload.user || null);
+      localStorage.setItem('token', payload.access_token);
+      if (expiresAt) localStorage.setItem('token_expires_at', expiresAt);
+      else localStorage.removeItem('token_expires_at');
+      setLoginError('');
+    } catch (error) {
+      setLoginError(error?.message || 'Lỗi kết nối server.');
     }
   };
 
   const handleLogout = () => {
-    setToken(null);
-    setSessionExpiresAt(null);
+    clearSession();
     setLoginPass('');
     setCurrentUser(null);
     setUsers([]);
-    localStorage.removeItem('token');
-    localStorage.removeItem('token_expires_at');
   };
 
   const handleChangePassword = async (event) => {

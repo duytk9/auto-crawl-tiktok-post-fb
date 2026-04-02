@@ -46,14 +46,6 @@ def parse_uuid_or_none(raw_id: str):
         return None
 
 
-def safe_remove_file(path: str | None):
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
 def mark_video_failed(video: Video, message: str):
     video.status = VideoStatus.failed
     video.last_error = message[:1000]

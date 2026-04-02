@@ -76,7 +76,7 @@ def process_task_queue(worker_name: str) -> int:
             )
 
             try:
-                result = _run_task(task)
+                result = run_task(task)
                 complete_task(db, task)
                 record_event(
                     "queue",
