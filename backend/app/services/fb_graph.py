@@ -161,13 +161,25 @@ def upload_video_to_facebook(file_path: str, caption: str, page_id: str, access_
         )
 
         if publish_result["ok"] and publish_result["data"].get("success"):
+            publish_identity = resolve_facebook_video_identity(video_id, access_token)
             log_structured(
                 "facebook_graph",
                 "info",
                 "Đã công bố Facebook Reel thành công.",
-                details={"page_id": page_id, "video_id": video_id},
+                details={
+                    "page_id": page_id,
+                    "video_id": video_id,
+                    "post_id": publish_identity.get("post_id"),
+                    "permalink_url": publish_identity.get("permalink_url"),
+                },
             )
-            return {"id": video_id}
+            return {
+                "id": video_id,
+                "video_id": video_id,
+                "post_id": publish_identity.get("post_id"),
+                "permalink_url": publish_identity.get("permalink_url"),
+                "comment_target_id": publish_identity.get("comment_target_id"),
+            }
 
         log_structured(
             "facebook_graph",
@@ -184,6 +196,43 @@ def upload_video_to_facebook(file_path: str, caption: str, page_id: str, access_
             details={"page_id": page_id, "file_path": file_path, "error": str(exc)},
         )
         return {"error": f"Lỗi hệ thống khi đăng FB: {exc}"}
+
+
+def resolve_facebook_video_identity(video_id: str, access_token: str) -> dict:
+    try:
+        result = _graph_get(
+            video_id,
+            params={
+                "fields": "id,post_id,permalink_url",
+                "access_token": access_token,
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "video_id": video_id,
+            "comment_target_id": video_id,
+            "message": f"Không thể tra cứu định danh bài đăng Facebook: {exc}",
+        }
+
+    if not result["ok"]:
+        return {
+            "ok": False,
+            "video_id": video_id,
+            "comment_target_id": video_id,
+            "message": result.get("message") or "Không thể tra cứu định danh bài đăng Facebook.",
+        }
+
+    data = result["data"] or {}
+    post_id = data.get("post_id")
+    return {
+        "ok": True,
+        "video_id": data.get("id") or video_id,
+        "post_id": post_id,
+        "permalink_url": data.get("permalink_url"),
+        "comment_target_id": post_id or data.get("id") or video_id,
+    }
 
 
 def inspect_page_access(page_id: str, access_token: str):
@@ -474,6 +523,67 @@ def reply_to_comment(comment_id: str, message: str, access_token: str):
             details={"comment_id": comment_id, "error": str(exc)},
         )
         return {"error": str(exc)}
+
+
+def publish_affiliate_comment(
+    *,
+    video_id: str | None,
+    post_id: str | None,
+    message: str,
+    access_token: str,
+):
+    message_text = (message or "").strip()
+    if not message_text:
+        return {"error": "Nội dung comment affiliate đang trống."}
+
+    resolved_identity = None
+    candidates = []
+    if post_id:
+        candidates.append(post_id)
+
+    if video_id:
+        resolved_identity = resolve_facebook_video_identity(video_id, access_token)
+        resolved_target = resolved_identity.get("comment_target_id")
+        if resolved_target:
+            candidates.append(resolved_target)
+        resolved_post_id = resolved_identity.get("post_id")
+        if resolved_post_id:
+            candidates.append(resolved_post_id)
+        resolved_video_id = resolved_identity.get("video_id")
+        if resolved_video_id:
+            candidates.append(resolved_video_id)
+
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate and candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+
+    if not unique_candidates:
+        return {"error": "Không xác định được đối tượng Facebook để comment affiliate."}
+
+    last_error = None
+    for candidate in unique_candidates:
+        result = _graph_post(
+            f"{candidate}/comments",
+            data={"message": message_text, "access_token": access_token},
+            timeout=30,
+        )
+        if result["ok"]:
+            payload = result["data"] or {}
+            return {
+                "id": payload.get("id"),
+                "target_id": candidate,
+                "comment_id": payload.get("id"),
+                "post_id": (resolved_identity or {}).get("post_id") or post_id,
+                "permalink_url": (resolved_identity or {}).get("permalink_url"),
+            }
+        last_error = result.get("message") or "Facebook từ chối comment affiliate."
+
+    return {
+        "error": last_error or "Không thể comment affiliate lên bài đăng.",
+        "post_id": (resolved_identity or {}).get("post_id") or post_id,
+        "permalink_url": (resolved_identity or {}).get("permalink_url"),
+    }
 
 
 def send_page_message(recipient_id: str, message: str, access_token: str):

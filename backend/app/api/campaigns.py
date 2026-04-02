@@ -8,13 +8,18 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, literal, or_
 from sqlalchemy.orm import Session
 
+from app.api.auth import require_authenticated_user
 from app.core.database import get_db
 from app.core.time import utc_now, utc_today
-from app.models.models import Campaign, CampaignStatus, FacebookPage, Video, VideoStatus
+from app.models.models import AffiliateCommentStatus, Campaign, CampaignStatus, FacebookPage, User, Video, VideoStatus
 from app.services.ai_generator import generate_caption
+from app.services.campaign_jobs import build_affiliate_comment_text
+from app.services.fb_graph import publish_affiliate_comment
 from app.services.observability import record_event
+from app.services.security import decrypt_secret
 from app.services.source_resolver import SourceResolutionError, resolve_content_source
 from app.services.task_queue import (
+    TASK_TYPE_AFFILIATE_COMMENT,
     TASK_TYPE_CAMPAIGN_SYNC,
     TASK_TYPE_VIDEO_RETRY,
     enqueue_task,
@@ -33,6 +38,10 @@ class CampaignCreate(BaseModel):
 
 class VideoCaptionUpdate(BaseModel):
     ai_caption: str = Field(min_length=3, max_length=5000)
+
+
+class AffiliateCommentManualReply(BaseModel):
+    message: str = Field(min_length=3, max_length=3000)
 
 
 def serialize_datetime(value):
@@ -131,7 +140,16 @@ def serialize_video(video: Video, page_name_map=None):
         "ai_caption": video.ai_caption,
         "status": normalize_status(video.status),
         "publish_time": serialize_datetime(video.publish_time),
+        "fb_video_id": video.fb_video_id,
         "fb_post_id": video.fb_post_id,
+        "fb_permalink_url": video.fb_permalink_url,
+        "affiliate_comment_status": normalize_status(video.affiliate_comment_status),
+        "affiliate_comment_text": video.affiliate_comment_text,
+        "affiliate_comment_fb_id": video.affiliate_comment_fb_id,
+        "affiliate_comment_error": video.affiliate_comment_error,
+        "affiliate_comment_attempts": video.affiliate_comment_attempts or 0,
+        "affiliate_comment_requested_at": serialize_datetime(video.affiliate_comment_requested_at),
+        "affiliate_commented_at": serialize_datetime(video.affiliate_commented_at),
         "last_error": video.last_error,
         "retry_count": video.retry_count or 0,
         "created_at": serialize_datetime(video.created_at),
@@ -601,8 +619,17 @@ def retry_video(video_id: str, db: Session = Depends(get_db)):
     if video.file_path and os.path.exists(video.file_path):
         video.status = VideoStatus.ready
         video.publish_time = utc_now()
+        video.fb_video_id = None
         video.last_error = None
         video.fb_post_id = None
+        video.fb_permalink_url = None
+        video.affiliate_comment_status = AffiliateCommentStatus.disabled
+        video.affiliate_comment_text = None
+        video.affiliate_comment_fb_id = None
+        video.affiliate_comment_error = None
+        video.affiliate_comment_attempts = 0
+        video.affiliate_comment_requested_at = None
+        video.affiliate_commented_at = None
         db.commit()
         db.refresh(video)
         page_name_map = build_page_name_map(db)
@@ -616,7 +643,16 @@ def retry_video(video_id: str, db: Session = Depends(get_db)):
 
     video.status = VideoStatus.downloading
     video.last_error = None
+    video.fb_video_id = None
     video.fb_post_id = None
+    video.fb_permalink_url = None
+    video.affiliate_comment_status = AffiliateCommentStatus.disabled
+    video.affiliate_comment_text = None
+    video.affiliate_comment_fb_id = None
+    video.affiliate_comment_error = None
+    video.affiliate_comment_attempts = 0
+    video.affiliate_comment_requested_at = None
+    video.affiliate_commented_at = None
     db.commit()
 
     task = enqueue_task(
@@ -629,3 +665,138 @@ def retry_video(video_id: str, db: Session = Depends(get_db)):
         max_attempts=3,
     )
     return {"message": f"Đã xếp lịch thử tải lại video {video.original_id}.", "task_id": str(task.id)}
+
+
+@router.get("/affiliate-comments")
+def get_affiliate_comment_queue(
+    status: str = "operator_required",
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+):
+    if page < 1 or limit < 1:
+        raise HTTPException(status_code=400, detail="Phân trang không hợp lệ.")
+
+    query = db.query(Video).join(Campaign)
+    if status != "all":
+        allowed = {item.value for item in AffiliateCommentStatus}
+        if status not in allowed:
+            raise HTTPException(status_code=400, detail="Bộ lọc trạng thái affiliate không hợp lệ.")
+        query = query.filter(Video.affiliate_comment_status == status)
+
+    total = query.count()
+    offset = (page - 1) * limit
+    videos = (
+        query.order_by(Video.updated_at.desc(), Video.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    page_name_map = build_page_name_map(db)
+    return {
+        "items": [serialize_video(video, page_name_map) for video in videos],
+        "total": total,
+        "page": page,
+        "pages": max(1, (total + limit - 1) // limit),
+    }
+
+
+@router.post("/videos/{video_id}/affiliate-comment/retry")
+def retry_affiliate_comment(video_id: str, db: Session = Depends(get_db)):
+    video = get_video_or_404(db, video_id)
+    if normalize_status(video.status) != VideoStatus.posted.value:
+        raise HTTPException(status_code=400, detail="Chỉ có thể comment affiliate khi video đã đăng thành công.")
+    if not video.campaign or not video.campaign.target_page_id:
+        raise HTTPException(status_code=400, detail="Video này chưa gắn với fanpage đích.")
+
+    page = db.query(FacebookPage).filter(FacebookPage.page_id == video.campaign.target_page_id).first()
+    if not page:
+        raise HTTPException(status_code=400, detail="Không tìm thấy fanpage cấu hình cho video này.")
+
+    affiliate_text = (video.affiliate_comment_text or "").strip() or build_affiliate_comment_text(page)
+    if not affiliate_text:
+        raise HTTPException(status_code=400, detail="Fanpage chưa có nội dung hoặc link affiliate để retry.")
+
+    available_at = utc_now() + timedelta(seconds=max(0, page.affiliate_comment_delay_seconds or 60))
+    video.affiliate_comment_status = AffiliateCommentStatus.queued
+    video.affiliate_comment_text = affiliate_text
+    video.affiliate_comment_error = None
+    video.affiliate_comment_requested_at = available_at
+    db.commit()
+
+    task = enqueue_task(
+        db,
+        task_type=TASK_TYPE_AFFILIATE_COMMENT,
+        entity_type="video",
+        entity_id=str(video.id),
+        payload={"video_id": str(video.id)},
+        priority=10,
+        max_attempts=3,
+        available_at=available_at,
+        dedupe_open_task=True,
+    )
+    page_name_map = build_page_name_map(db)
+    return {
+        "message": "Đã xếp lại comment affiliate vào hàng chờ.",
+        "task_id": str(task.id),
+        "video": serialize_video(video, page_name_map),
+    }
+
+
+@router.post("/videos/{video_id}/affiliate-comment/manual")
+def send_affiliate_comment_manually(
+    video_id: str,
+    payload: AffiliateCommentManualReply,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_authenticated_user),
+):
+    video = get_video_or_404(db, video_id)
+    if normalize_status(video.status) != VideoStatus.posted.value:
+        raise HTTPException(status_code=400, detail="Video chưa đăng thành công nên chưa thể comment affiliate.")
+    if not video.campaign or not video.campaign.target_page_id:
+        raise HTTPException(status_code=400, detail="Video này chưa gắn với fanpage đích.")
+
+    page = db.query(FacebookPage).filter(FacebookPage.page_id == video.campaign.target_page_id).first()
+    if not page or not page.long_lived_access_token:
+        raise HTTPException(status_code=400, detail="Fanpage chưa có token hợp lệ để gửi comment affiliate.")
+
+    access_token = decrypt_secret(page.long_lived_access_token)
+    result = publish_affiliate_comment(
+        video_id=video.fb_video_id or video.fb_post_id,
+        post_id=video.fb_post_id,
+        message=payload.message.strip(),
+        access_token=access_token,
+    )
+    if not result or not result.get("comment_id"):
+        video.affiliate_comment_status = AffiliateCommentStatus.operator_required
+        video.affiliate_comment_error = str((result or {}).get("error") or "Không thể gửi comment affiliate thủ công.")
+        db.commit()
+        raise HTTPException(status_code=502, detail=video.affiliate_comment_error)
+
+    video.affiliate_comment_status = AffiliateCommentStatus.posted
+    video.affiliate_comment_text = payload.message.strip()
+    video.affiliate_comment_fb_id = result.get("comment_id")
+    video.affiliate_comment_error = None
+    video.affiliate_commented_at = utc_now()
+    video.fb_post_id = result.get("post_id") or video.fb_post_id
+    video.fb_permalink_url = result.get("permalink_url") or video.fb_permalink_url
+    db.commit()
+    db.refresh(video)
+    record_event(
+        "affiliate_comment",
+        "info",
+        "Operator đã gửi comment affiliate thủ công.",
+        db=db,
+        actor_user_id=str(current_user.id),
+        details={
+            "video_id": str(video.id),
+            "campaign_id": str(video.campaign_id),
+            "page_id": page.page_id,
+            "comment_id": video.affiliate_comment_fb_id,
+        },
+    )
+    page_name_map = build_page_name_map(db)
+    return {
+        "message": "Đã gửi comment affiliate thủ công thành công.",
+        "video": serialize_video(video, page_name_map),
+    }

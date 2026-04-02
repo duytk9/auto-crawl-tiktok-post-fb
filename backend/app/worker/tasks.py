@@ -4,9 +4,16 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.services.campaign_jobs import reply_to_comment_job, reply_to_message_job, retry_video_download, sync_campaign_content
+from app.services.campaign_jobs import (
+    post_affiliate_comment_job,
+    reply_to_comment_job,
+    reply_to_message_job,
+    retry_video_download,
+    sync_campaign_content,
+)
 from app.services.observability import record_event, update_worker_heartbeat
 from app.services.task_queue import (
+    TASK_TYPE_AFFILIATE_COMMENT,
     TASK_TYPE_CAMPAIGN_SYNC,
     TASK_TYPE_COMMENT_REPLY,
     TASK_TYPE_MESSAGE_REPLY,
@@ -29,6 +36,12 @@ def _run_task(task) -> dict:
         )
     if task.task_type == TASK_TYPE_VIDEO_RETRY:
         return retry_video_download(payload.get("video_id", task.entity_id or ""))
+    if task.task_type == TASK_TYPE_AFFILIATE_COMMENT:
+        return post_affiliate_comment_job(
+            payload.get("video_id", task.entity_id or ""),
+            attempt_number=task.attempts or 1,
+            max_attempts=task.max_attempts or 1,
+        )
     if task.task_type == TASK_TYPE_COMMENT_REPLY:
         return reply_to_comment_job(payload.get("interaction_log_id", task.entity_id or ""))
     if task.task_type == TASK_TYPE_MESSAGE_REPLY:

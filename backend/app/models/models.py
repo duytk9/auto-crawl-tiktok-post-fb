@@ -24,6 +24,13 @@ class VideoStatus(str, enum.Enum):
     failed = "failed"
 
 
+class AffiliateCommentStatus(str, enum.Enum):
+    disabled = "disabled"
+    queued = "queued"
+    posted = "posted"
+    operator_required = "operator_required"
+
+
 class InteractionStatus(str, enum.Enum):
     pending = "pending"
     replied = "replied"
@@ -87,7 +94,16 @@ class Video(Base):
     ai_caption = Column(String, nullable=True)
     status = Column(Enum(VideoStatus), default=VideoStatus.pending)
     publish_time = Column(DateTime, nullable=True)
+    fb_video_id = Column(String, nullable=True)
     fb_post_id = Column(String, nullable=True)
+    fb_permalink_url = Column(String, nullable=True)
+    affiliate_comment_status = Column(Enum(AffiliateCommentStatus), default=AffiliateCommentStatus.disabled, nullable=False)
+    affiliate_comment_text = Column(String, nullable=True)
+    affiliate_comment_fb_id = Column(String, nullable=True)
+    affiliate_comment_error = Column(String, nullable=True)
+    affiliate_comment_attempts = Column(Integer, default=0, nullable=False)
+    affiliate_comment_requested_at = Column(DateTime, nullable=True)
+    affiliate_commented_at = Column(DateTime, nullable=True)
     last_error = Column(String, nullable=True)
     retry_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=utc_now)
@@ -111,6 +127,10 @@ class FacebookPage(Base):
     message_reply_start_time = Column(String, default="08:00", nullable=False)
     message_reply_end_time = Column(String, default="22:00", nullable=False)
     message_reply_cooldown_minutes = Column(Integer, default=0, nullable=False)
+    affiliate_comment_enabled = Column(Boolean, default=False, nullable=False)
+    affiliate_comment_text = Column(String, nullable=True)
+    affiliate_link_url = Column(String, nullable=True)
+    affiliate_comment_delay_seconds = Column(Integer, default=60, nullable=False)
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 

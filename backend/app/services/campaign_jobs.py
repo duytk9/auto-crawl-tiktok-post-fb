@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import os
+import random
 import uuid
 
 from sqlalchemy import func
@@ -10,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.database import SessionLocal
 from app.core.time import utc_now
 from app.models.models import (
+    AffiliateCommentStatus,
     Campaign,
     CampaignStatus,
     ConversationStatus,
@@ -22,7 +24,7 @@ from app.models.models import (
     VideoStatus,
 )
 from app.services.ai_generator import generate_message_reply_with_context, generate_reply
-from app.services.fb_graph import reply_to_comment, send_page_message
+from app.services.fb_graph import publish_affiliate_comment, reply_to_comment, send_page_message
 from app.services.inbox_memory import (
     apply_conversation_ai_state,
     get_or_create_inbox_conversation,
@@ -33,6 +35,7 @@ from app.services.inbox_memory import (
 from app.services.observability import record_event
 from app.services.security import decrypt_secret
 from app.services.source_resolver import SourceResolutionError, resolve_content_source
+from app.services.task_queue import TASK_TYPE_AFFILIATE_COMMENT, enqueue_task
 from app.services.ytdlp_crawler import download_video, extract_source_entries
 
 
@@ -55,6 +58,56 @@ def mark_video_failed(video: Video, message: str):
     video.status = VideoStatus.failed
     video.last_error = message[:1000]
     video.retry_count = (video.retry_count or 0) + 1
+
+
+def parse_affiliate_lines(raw_value: str | None) -> list[str]:
+    return [line.strip() for line in (raw_value or "").splitlines() if line.strip()]
+
+
+def has_affiliate_comment_options(page: FacebookPage) -> bool:
+    return bool(parse_affiliate_lines(page.affiliate_comment_text) or parse_affiliate_lines(page.affiliate_link_url))
+
+
+def build_affiliate_comment_text(page: FacebookPage, *, chooser=random.choice) -> str | None:
+    contents = parse_affiliate_lines(page.affiliate_comment_text)
+    links = parse_affiliate_lines(page.affiliate_link_url)
+    content = chooser(contents) if contents else None
+    link = chooser(links) if links else None
+    parts = [part for part in [content, link] if part]
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def queue_affiliate_comment_for_video(db: Session, video: Video, page: FacebookPage) -> dict | None:
+    affiliate_text = build_affiliate_comment_text(page)
+    if not page.affiliate_comment_enabled or not affiliate_text:
+        video.affiliate_comment_status = AffiliateCommentStatus.disabled
+        video.affiliate_comment_text = affiliate_text
+        video.affiliate_comment_error = None
+        video.affiliate_comment_fb_id = None
+        video.affiliate_comment_requested_at = None
+        video.affiliate_commented_at = None
+        return None
+
+    available_at = utc_now() + timedelta(seconds=max(0, page.affiliate_comment_delay_seconds or 60))
+    video.affiliate_comment_status = AffiliateCommentStatus.queued
+    video.affiliate_comment_text = affiliate_text
+    video.affiliate_comment_error = None
+    video.affiliate_comment_fb_id = None
+    video.affiliate_comment_requested_at = available_at
+    task = enqueue_task(
+        db,
+        task_type=TASK_TYPE_AFFILIATE_COMMENT,
+        entity_type="video",
+        entity_id=str(video.id),
+        payload={"video_id": str(video.id)},
+        priority=10,
+        max_attempts=3,
+        available_at=available_at,
+        dedupe_open_task=True,
+    )
+    return {"task_id": str(task.id), "available_at": available_at.isoformat()}
 
 
 def set_campaign_sync_state(campaign: Campaign, status: str, error: str | None = None, finished_at: datetime | None = None):
@@ -125,6 +178,16 @@ def retry_video_download(video_id: str) -> dict:
             video.file_path = out_path
             video.status = VideoStatus.ready
             video.publish_time = utc_now()
+            video.fb_video_id = None
+            video.fb_post_id = None
+            video.fb_permalink_url = None
+            video.affiliate_comment_status = AffiliateCommentStatus.disabled
+            video.affiliate_comment_text = None
+            video.affiliate_comment_fb_id = None
+            video.affiliate_comment_error = None
+            video.affiliate_comment_attempts = 0
+            video.affiliate_comment_requested_at = None
+            video.affiliate_commented_at = None
             video.last_error = None
             db.commit()
             record_event(
@@ -267,6 +330,16 @@ def sync_campaign_content(
                 db_video.file_path = out_path
                 db_video.status = VideoStatus.ready
                 db_video.last_error = None
+                db_video.fb_video_id = None
+                db_video.fb_post_id = None
+                db_video.fb_permalink_url = None
+                db_video.affiliate_comment_status = AffiliateCommentStatus.disabled
+                db_video.affiliate_comment_text = None
+                db_video.affiliate_comment_fb_id = None
+                db_video.affiliate_comment_error = None
+                db_video.affiliate_comment_attempts = 0
+                db_video.affiliate_comment_requested_at = None
+                db_video.affiliate_commented_at = None
             else:
                 mark_video_failed(db_video, "Tải video thất bại.")
             db.commit()
@@ -503,6 +576,101 @@ def reply_to_message_job(message_log_id: str) -> dict:
             db=db,
             details={"log_id": message_log_id, "error": str(exc)},
         )
+        raise
+    finally:
+        db.close()
+
+
+def post_affiliate_comment_job(video_id: str, *, attempt_number: int = 1, max_attempts: int = 3) -> dict:
+    db: Session = SessionLocal()
+    try:
+        video_uuid = parse_uuid_or_none(video_id)
+        if not video_uuid:
+            raise ValueError("Mã video không hợp lệ.")
+
+        video = db.query(Video).filter(Video.id == video_uuid).first()
+        if not video:
+            raise ValueError("Không tìm thấy video cần comment affiliate.")
+
+        if video.status != VideoStatus.posted:
+            raise ValueError("Video chưa ở trạng thái đã đăng nên chưa thể comment affiliate.")
+
+        if video.affiliate_comment_status == AffiliateCommentStatus.posted and video.affiliate_comment_fb_id:
+            return {"ok": True, "skipped": True, "reason": "already_commented", "video_id": video_id}
+
+        if not video.campaign or not video.campaign.target_page_id:
+            raise ValueError("Video chưa gắn với fanpage đích.")
+
+        page = db.query(FacebookPage).filter(FacebookPage.page_id == video.campaign.target_page_id).first()
+        if not page or not page.long_lived_access_token:
+            raise ValueError("Fanpage chưa có token hợp lệ để comment affiliate.")
+
+        access_token = decrypt_secret(page.long_lived_access_token)
+        affiliate_text = (video.affiliate_comment_text or "").strip() or build_affiliate_comment_text(page)
+        if not affiliate_text:
+            video.affiliate_comment_status = AffiliateCommentStatus.disabled
+            video.affiliate_comment_error = None
+            db.commit()
+            return {"ok": True, "skipped": True, "reason": "affiliate_disabled", "video_id": video_id}
+
+        video.affiliate_comment_attempts = max(video.affiliate_comment_attempts or 0, attempt_number)
+        result = publish_affiliate_comment(
+            video_id=video.fb_video_id or video.fb_post_id,
+            post_id=video.fb_post_id,
+            message=affiliate_text,
+            access_token=access_token,
+        )
+        if result and result.get("comment_id"):
+            video.fb_post_id = result.get("post_id") or video.fb_post_id
+            video.fb_permalink_url = result.get("permalink_url") or video.fb_permalink_url
+            video.affiliate_comment_status = AffiliateCommentStatus.posted
+            video.affiliate_comment_fb_id = result.get("comment_id")
+            video.affiliate_comment_error = None
+            video.affiliate_commented_at = utc_now()
+            db.commit()
+            record_event(
+                "affiliate_comment",
+                "info",
+                "Đã comment affiliate thành công sau khi đăng video.",
+                db=db,
+                details={
+                    "video_id": str(video.id),
+                    "campaign_id": str(video.campaign_id),
+                    "page_id": page.page_id,
+                    "comment_id": video.affiliate_comment_fb_id,
+                },
+            )
+            return {"ok": True, "video_id": video_id, "comment_id": video.affiliate_comment_fb_id}
+
+        error_message = str((result or {}).get("error") or "Không thể comment affiliate lên bài đăng.")
+        video.affiliate_comment_error = error_message[:1000]
+        if attempt_number >= max_attempts:
+            video.affiliate_comment_status = AffiliateCommentStatus.operator_required
+            db.commit()
+            record_event(
+                "affiliate_comment",
+                "warning",
+                "Comment affiliate thất bại nhiều lần, cần operator xử lý.",
+                db=db,
+                details={
+                    "video_id": str(video.id),
+                    "campaign_id": str(video.campaign_id),
+                    "page_id": page.page_id,
+                    "error": error_message,
+                },
+            )
+            return {
+                "ok": False,
+                "operator_required": True,
+                "video_id": video_id,
+                "error": error_message,
+            }
+
+        video.affiliate_comment_status = AffiliateCommentStatus.queued
+        db.commit()
+        raise RuntimeError(error_message)
+    except Exception:
+        db.rollback()
         raise
     finally:
         db.close()

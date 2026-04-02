@@ -91,6 +91,10 @@ function buildReplyAutomationDraft(pageItem) {
     message_reply_start_time: pageItem?.message_reply_start_time || '08:00',
     message_reply_end_time: pageItem?.message_reply_end_time || '22:00',
     message_reply_cooldown_minutes: pageItem?.message_reply_cooldown_minutes ?? 0,
+    affiliate_comment_enabled: pageItem?.affiliate_comment_enabled ?? false,
+    affiliate_comment_text: pageItem?.affiliate_comment_text || '',
+    affiliate_link_url: pageItem?.affiliate_link_url || '',
+    affiliate_comment_delay_seconds: pageItem?.affiliate_comment_delay_seconds ?? 60,
   };
 }
 
@@ -141,6 +145,8 @@ const STATUS_LABELS = {
   failed: 'Thất bại',
   replied: 'Đã trả lời',
   ignored: 'Bỏ qua',
+  disabled: 'Tắt',
+  operator_required: 'Cần operator',
   page_access_token: 'Token trang',
   user_access_token: 'Token người dùng',
   invalid_token: 'Token không hợp lệ',
@@ -253,6 +259,8 @@ function getStatusClasses(status) {
     failed: 'border-rose-400/25 bg-rose-400/10 text-rose-100',
     replied: 'border-emerald-400/25 bg-emerald-400/10 text-emerald-100',
     ignored: 'border-white/10 bg-white/5 text-slate-200',
+    disabled: 'border-white/10 bg-white/5 text-slate-200',
+    operator_required: 'border-rose-400/25 bg-rose-400/10 text-rose-100',
     page_access_token: 'border-emerald-400/25 bg-emerald-400/10 text-emerald-100',
     user_access_token: 'border-rose-400/25 bg-rose-400/10 text-rose-100',
     invalid_token: 'border-rose-400/25 bg-rose-400/10 text-rose-100',
@@ -762,6 +770,7 @@ function LoginScreen({ loginUser, setLoginUser, loginPass, setLoginPass, loginEr
 function App() {
   const [campaigns, setCampaigns] = useState([]);
   const [videos, setVideos] = useState([]);
+  const [affiliateOperatorItems, setAffiliateOperatorItems] = useState([]);
   const [interactions, setInteractions] = useState([]);
   const [conversationList, setConversationList] = useState([]);
   const [selectedConversationId, setSelectedConversationId] = useState(null);
@@ -813,6 +822,7 @@ function App() {
   const [overviewSourceFilter, setOverviewSourceFilter] = useState('all');
   const [conversationStatusFilter, setConversationStatusFilter] = useState('all');
   const [manualReplyDraft, setManualReplyDraft] = useState('');
+  const [affiliateManualDrafts, setAffiliateManualDrafts] = useState({});
   const [conversationNoteDraft, setConversationNoteDraft] = useState('');
   const [conversationAssigneeDraft, setConversationAssigneeDraft] = useState('');
   const [pendingOperatorComposerId, setPendingOperatorComposerId] = useState(null);
@@ -867,6 +877,7 @@ function App() {
   const toggleExpandedItem = (key) => setExpandedItems((current) => ({ ...current, [key]: !current[key] }));
   const handoffConversations = conversationList.filter((conversation) => conversation.status === 'operator_active');
   const resolvedConversations = conversationList.filter((conversation) => conversation.status === 'resolved');
+  const affiliateEnabledPages = fbPages.filter((pageItem) => pageItem.affiliate_comment_enabled).length;
   const visibleConversations = conversationStatusFilter === 'all'
     ? conversationList
     : conversationList.filter((conversation) => conversation.status === conversationStatusFilter);
@@ -922,10 +933,11 @@ function App() {
       if (filters.campaignId !== 'all') params.set('campaign_id', filters.campaignId);
       if (filters.sourcePlatform !== 'all') params.set('source_platform', filters.sourcePlatform);
 
-      const [campaignsData, statsData, videosData, fbData, logsData, conversationsData, systemData, healthData, taskData, eventData, workerData, userData] = await Promise.all([
+      const [campaignsData, statsData, videosData, affiliateData, fbData, logsData, conversationsData, systemData, healthData, taskData, eventData, workerData, userData] = await Promise.all([
         requestJson(`${API_URL}/campaigns/`),
         requestJson(`${API_URL}/campaigns/stats`),
         requestJson(`${API_URL}/campaigns/videos?${params.toString()}`),
+        requestJson(`${API_URL}/campaigns/affiliate-comments?status=operator_required&limit=30`),
         requestJson(`${API_URL}/facebook/config`),
         requestJson(`${API_URL}/webhooks/logs`),
         requestJson(`${API_URL}/webhooks/conversations?limit=80`),
@@ -941,6 +953,7 @@ function App() {
       setCampaigns(campaignsData);
       setStats(statsData);
       setVideos(videosData.videos);
+      setAffiliateOperatorItems(affiliateData.items || []);
       setFilteredVideoTotal(videosData.total ?? 0);
       setTotalPages(videosData.pages);
       setFbPages(fbData);
@@ -967,6 +980,18 @@ function App() {
     setRuntimeConfig(payload);
     setRuntimeForm(extractRuntimeForm(payload));
   };
+
+  useEffect(() => {
+    setAffiliateManualDrafts((current) => {
+      const next = { ...current };
+      affiliateOperatorItems.forEach((item) => {
+        if (!next[item.id]) {
+          next[item.id] = item.affiliate_comment_text || '';
+        }
+      });
+      return next;
+    });
+  }, [affiliateOperatorItems]);
 
   const loadConversationDetail = async (conversationId, { silent = false } = {}) => {
     if (!token || !conversationId) {
@@ -1529,6 +1554,7 @@ function App() {
   };
 
   const handleCaptionChange = (videoId, value) => setCaptionDrafts((current) => ({ ...current, [videoId]: value }));
+  const handleAffiliateDraftChange = (videoId, value) => setAffiliateManualDrafts((current) => ({ ...current, [videoId]: value }));
 
   const handleSaveCaption = async (videoId) => {
     const ai_caption = (captionDrafts[videoId] || '').trim();
@@ -1542,6 +1568,33 @@ function App() {
       body: JSON.stringify({ ai_caption }),
     }));
     if (payload?.video) setCaptionDrafts((current) => ({ ...current, [videoId]: payload.video.ai_caption || '' }));
+  };
+
+  const handleRetryAffiliateComment = async (videoId) => {
+    await runAction(`affiliate-retry-${videoId}`, () => requestJson(`${API_URL}/campaigns/videos/${videoId}/affiliate-comment/retry`, {
+      method: 'POST',
+    }));
+  };
+
+  const handleManualAffiliateComment = async (videoId) => {
+    const message = (affiliateManualDrafts[videoId] || '').trim();
+    if (message.length < 3) {
+      showNotice('error', 'Nội dung comment affiliate cần ít nhất 3 ký tự.');
+      return;
+    }
+
+    const payload = await runAction(`affiliate-manual-${videoId}`, () => requestJson(`${API_URL}/campaigns/videos/${videoId}/affiliate-comment/manual`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    }));
+
+    if (payload?.video) {
+      setAffiliateManualDrafts((current) => ({
+        ...current,
+        [videoId]: payload.video.affiliate_comment_text || message,
+      }));
+    }
   };
 
   const handleCampaignAction = async (campaign, action) => {
@@ -2324,6 +2377,82 @@ function App() {
   );
   const renderQueueSection = () => (
     <div className="space-y-6">
+      <Panel eyebrow="Affiliate" title="Comment aff cần operator xử lý">
+        {affiliateOperatorItems.length === 0 ? (
+          <EmptyState title="Chưa có video nào cần comment tay" description="Nếu comment aff tự động lỗi sau retry, mục đó sẽ hiện ở đây để operator xử lý." />
+        ) : (
+          <div className="space-y-4">
+            {affiliateOperatorItems.map((item) => {
+              const sourcePlatformMeta = getSourcePlatformMeta(item.source_platform);
+              return (
+                <article key={item.id} className="rounded-[22px] border border-rose-400/15 bg-rose-400/5 p-4">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="min-w-0">
+                      <div className="font-display text-base font-semibold text-white sm:text-[1.05rem]">
+                        {item.campaign_name || 'Chưa rõ chiến dịch'}
+                      </div>
+                      <div className="mt-1 text-sm text-[var(--text-soft)]">
+                        {item.target_page_name || item.target_page_id || 'Chưa rõ fanpage'} • {item.original_id}
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <span className={cx('inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-medium', getStatusClasses(item.affiliate_comment_status))}>
+                          <AlertTriangle className="h-3.5 w-3.5" />
+                          {getStatusLabel(item.affiliate_comment_status)}
+                        </span>
+                        <StatusPill tone={sourcePlatformMeta.tone}>{sourcePlatformMeta.label}</StatusPill>
+                        <StatusPill tone="slate">{getSourceKindLabel(item.source_kind)}</StatusPill>
+                        <StatusPill tone="amber">Attempt {item.affiliate_comment_attempts ?? 0}</StatusPill>
+                      </div>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <InfoRow label="Đăng lúc" value={formatDateTime(item.updated_at)} emphasis />
+                      <InfoRow label="Link bài đăng" value={item.fb_permalink_url ? 'Có' : 'Chưa có'} />
+                    </div>
+                  </div>
+                  {item.affiliate_comment_error ? (
+                    <div className="mt-4 rounded-[20px] border border-rose-400/20 bg-rose-400/10 px-4 py-3 text-sm text-rose-100">
+                      {item.affiliate_comment_error}
+                    </div>
+                  ) : null}
+                  <textarea
+                    className={cx(FIELD_CLASS, 'mt-4 min-h-[140px] resize-y')}
+                    value={affiliateManualDrafts[item.id] ?? item.affiliate_comment_text ?? ''}
+                    onChange={(event) => handleAffiliateDraftChange(item.id, event.target.value)}
+                    placeholder="Nhập nội dung comment affiliate để operator gửi tay..."
+                  />
+                  <div className="mobile-action-stack mt-4">
+                    {item.fb_permalink_url ? (
+                      <a href={item.fb_permalink_url} target="_blank" rel="noreferrer" className={BUTTON_GHOST}>
+                        <ExternalLink className="h-4 w-4" />
+                        Mở bài đăng
+                      </a>
+                    ) : null}
+                    <button
+                      type="button"
+                      className={BUTTON_SECONDARY}
+                      onClick={() => handleRetryAffiliateComment(item.id)}
+                      disabled={actionState[`affiliate-retry-${item.id}`]}
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      {actionState[`affiliate-retry-${item.id}`] ? 'Đang xếp lại...' : 'Retry tự động'}
+                    </button>
+                    <button
+                      type="button"
+                      className={BUTTON_PRIMARY}
+                      onClick={() => handleManualAffiliateComment(item.id)}
+                      disabled={actionState[`affiliate-manual-${item.id}`]}
+                    >
+                      <MessagesSquare className="h-4 w-4" />
+                      {actionState[`affiliate-manual-${item.id}`] ? 'Đang gửi...' : 'Comment tay ngay'}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </Panel>
+
       <Panel eyebrow="Bộ lọc" title="Hàng chờ đăng bài">
         <div className="grid gap-4 xl:grid-cols-[220px_280px_220px_minmax(0,1fr)]">
           <label className="space-y-2">
@@ -2524,8 +2653,10 @@ function App() {
         <div className="grid gap-4 lg:grid-cols-3">
           <InfoRow label="Inbox đang chờ" value={systemInfo?.pending_message_replies ?? 0} emphasis />
           <InfoRow label="Fanpage bật inbox AI" value={systemInfo?.message_auto_reply_pages ?? 0} />
+          <InfoRow label="Fanpage bật aff comment" value={affiliateEnabledPages} />
           <InfoRow label="Webhook fanpage đã nối" value={`${connectedMessagePages}/${fbPages.length || 0}`} />
           <InfoRow label="Cần operator xử lý" value={handoffConversations.length} emphasis={handoffConversations.length > 0} />
+          <InfoRow label="Aff cần operator" value={affiliateOperatorItems.length} emphasis={affiliateOperatorItems.length > 0} />
           <InfoRow label="Đã xử lý" value={resolvedConversations.length} />
           <InfoRow label="Tổng conversation" value={conversationList.length} />
         </div>
@@ -2563,6 +2694,9 @@ function App() {
                         </StatusPill>
                         <StatusPill tone={draft.message_reply_cooldown_minutes > 0 ? 'amber' : 'slate'}>
                           Cooldown: {draft.message_reply_cooldown_minutes > 0 ? `${draft.message_reply_cooldown_minutes} phút` : 'Tắt'}
+                        </StatusPill>
+                        <StatusPill tone={draft.affiliate_comment_enabled ? 'rose' : 'slate'}>
+                          Aff: {draft.affiliate_comment_enabled ? `${draft.affiliate_comment_delay_seconds}s` : 'Tắt'}
                         </StatusPill>
                       </div>
                       <div className="mt-3 rounded-[20px] border border-white/8 bg-black/10 px-4 py-3 text-sm text-[var(--text-soft)]">
@@ -2688,6 +2822,57 @@ function App() {
                               <div className="text-sm text-[var(--text-soft)]">Tính theo phút, giờ Việt Nam.</div>
                             </label>
                           </div>
+                        </div>
+                      </div>
+                      <div className="mt-4 rounded-[24px] border border-white/8 bg-black/10 p-4">
+                        <label className="flex items-center justify-between gap-3 rounded-[20px] border border-white/8 bg-black/10 px-4 py-3">
+                          <div>
+                            <div className="font-medium text-white">Comment affiliate sau khi đăng</div>
+                            <div className="mt-1 text-sm text-[var(--text-soft)]">Tự comment link aff vào bài đăng mới của fanpage này.</div>
+                          </div>
+                          <input
+                            type="checkbox"
+                            checked={draft.affiliate_comment_enabled}
+                            onChange={(event) => handleReplyAutomationDraftChange(pageItem.page_id, 'affiliate_comment_enabled', event.target.checked)}
+                          />
+                        </label>
+                        <div className="mt-4 grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+                          <label className="space-y-2">
+                            <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Delay sau khi đăng (giây)</span>
+                            <input
+                              type="number"
+                              min="0"
+                              max="3600"
+                              className={FIELD_CLASS}
+                              value={draft.affiliate_comment_delay_seconds}
+                              onChange={(event) => handleReplyAutomationDraftChange(pageItem.page_id, 'affiliate_comment_delay_seconds', parseInt(event.target.value, 10) || 0)}
+                              disabled={!draft.affiliate_comment_enabled}
+                            />
+                            <div className="text-sm text-[var(--text-soft)]">Khuyến nghị 60 giây để Facebook kịp tạo object comment.</div>
+                          </label>
+                          <label className="space-y-2">
+                            <span className="text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Danh sách link affiliate</span>
+                            <textarea
+                              className={FIELD_CLASS}
+                              value={draft.affiliate_link_url}
+                              onChange={(event) => handleReplyAutomationDraftChange(pageItem.page_id, 'affiliate_link_url', event.target.value)}
+                              placeholder={'https://link-aff-1\nhttps://link-aff-2'}
+                              disabled={!draft.affiliate_comment_enabled}
+                              rows={4}
+                            />
+                            <div className="text-sm text-[var(--text-soft)]">Mỗi link một dòng. Hệ thống sẽ random hoàn toàn 1 link cho mỗi video.</div>
+                          </label>
+                        </div>
+                        <div className="mt-4 text-xs uppercase tracking-[0.24em] text-[var(--text-muted)]">Danh sách nội dung comment affiliate</div>
+                        <textarea
+                          className={cx(FIELD_CLASS, 'mt-3 min-h-[140px] resize-y')}
+                          value={draft.affiliate_comment_text}
+                          onChange={(event) => handleReplyAutomationDraftChange(pageItem.page_id, 'affiliate_comment_text', event.target.value)}
+                          placeholder={'Link sản phẩm mình để ở đây nhé.\nMình để link tham khảo ở dưới cho bạn nha.\nBạn xem link chi tiết giúp mình ở đây nhé.'}
+                          disabled={!draft.affiliate_comment_enabled}
+                        />
+                        <div className="mt-3 text-sm text-[var(--text-soft)]">
+                          Mỗi nội dung hoặc link nhập trên một dòng. Khi tới lượt comment, hệ thống sẽ random hoàn toàn 1 nội dung và 1 link, ghép lại rồi comment sau {draft.affiliate_comment_delay_seconds || 0} giây. Nếu fail sau retry, mục đó sẽ rơi sang `Comment aff cần operator xử lý`.
                         </div>
                       </div>
                     </>

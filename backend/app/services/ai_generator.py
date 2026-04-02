@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from typing import Any
 
 from app.core.config import settings
@@ -17,6 +18,70 @@ DEFAULT_MESSAGE_REPLY_PROMPT = (
     "Hãy trả lời tin nhắn inbox theo phong cách lịch sự, rõ ràng, hữu ích và chủ động gợi mở bước tiếp theo khi phù hợp. "
     "Chỉ trả về nội dung tin nhắn gửi cho khách."
 )
+
+
+def _strip_hashtag_tokens(text: str) -> str:
+    return " ".join(token for token in (text or "").replace("\n", " ").split() if not token.startswith("#")).strip()
+
+
+def _slugify_ascii(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    return "".join(char for char in ascii_text.lower() if char.isalnum() or char.isspace()).strip()
+
+
+def _build_caption_hashtags(original_caption: str, caption_body: str) -> list[str]:
+    corpus = _slugify_ascii(f"{original_caption} {caption_body}")
+    hashtags = []
+
+    if any(keyword in corpus for keyword in ["trung quoc", "china", "chinese"]):
+        hashtags.append("#gaixinhtrungquoc")
+
+    if any(keyword in corpus for keyword in ["nhay", "dance", "dancing", "vu dao"]):
+        hashtags.append("#gaixinhnhay")
+
+    if "gaixinhtrungquoc" not in [tag.lstrip("#") for tag in hashtags]:
+        hashtags.append("#gaixinh")
+    if "gaixinhnhay" not in [tag.lstrip("#") for tag in hashtags]:
+        hashtags.append("#gaixinhnhay")
+
+    hashtags.extend(["#viral", "#trending", "#xuhuong"])
+
+    deduped = []
+    for tag in hashtags:
+        if tag not in deduped:
+            deduped.append(tag)
+        if len(deduped) == 4:
+            break
+    return deduped
+
+
+def _normalize_caption_length(caption: str, original_caption: str) -> str:
+    normalized = _strip_hashtag_tokens(caption)
+    normalized = " ".join(normalized.replace("\n", " ").split()).strip()
+    backup = " ".join(_strip_hashtag_tokens(original_caption).split()).strip()
+
+    if not normalized:
+        normalized = backup
+
+    words = normalized.split()
+    if len(words) > 20:
+        return " ".join(words[:20]).strip()
+
+    if len(words) >= 15:
+        return normalized
+
+    backup_words = backup.split()
+    extended_words = list(words)
+    for candidate in backup_words:
+        if len(extended_words) >= 15:
+            break
+        extended_words.append(candidate)
+
+    if not extended_words:
+        return ""
+
+    return " ".join(extended_words[:20]).strip()
 
 
 def _extract_json_payload(raw_text: str) -> dict[str, Any] | None:
@@ -128,13 +193,19 @@ def _generate_with_gemini(
 
 def generate_caption(original_caption: str) -> str:
     prompt = f"""Bạn là Trùm Copywriter chuyên viral content Facebook. Mệnh lệnh bắt buộc:
-1. Viết lại caption sao cho kịch tính, thú vị, xài emoji hợp lý, độ dài 50-100 từ.
-2. Ngay lập tức loại bỏ toàn bộ hashtag cũ trong caption gốc.
-3. Dựa vào nội dung, tự bổ sung 5-6 hashtag phù hợp cho Facebook.
-Kết quả chỉ trả về đoạn caption thuần túy, không có giải thích.
+1. Viết lại caption sao cho kịch tính, thú vị, tự nhiên, đúng ngữ cảnh video.
+2. Caption bắt buộc chỉ dài từ 15 đến 20 từ, không ít hơn và không nhiều hơn.
+3. Sau caption chính, thêm đúng 4 hashtag viết liền không dấu, ưu tiên kiểu: #gaixinhtrungquoc #gaixinhnhay #viral #trending.
+4. Không thêm giải thích, không thêm tiêu đề, không xuống dòng.
 
 Caption gốc: {original_caption}"""
-    return _generate_with_gemini(prompt, f"{original_caption}\n\n#giaitri #trending", timeout=30)
+    fallback_body = _normalize_caption_length(_strip_hashtag_tokens(original_caption), original_caption)
+    fallback_hashtags = _build_caption_hashtags(original_caption, fallback_body)
+    fallback = f"{fallback_body} {' '.join(fallback_hashtags)}".strip()
+    generated = _generate_with_gemini(prompt, fallback, timeout=30)
+    normalized_body = _normalize_caption_length(generated, original_caption)
+    hashtags = _build_caption_hashtags(original_caption, normalized_body)
+    return f"{normalized_body} {' '.join(hashtags)}".strip()
 
 
 def generate_message_reply_with_context(

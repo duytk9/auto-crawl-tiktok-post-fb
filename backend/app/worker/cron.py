@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.time import utc_now
-from app.models.models import Campaign, CampaignStatus, FacebookPage, Video, VideoStatus
+from app.models.models import AffiliateCommentStatus, Campaign, CampaignStatus, FacebookPage, Video, VideoStatus
 from app.services.ai_generator import generate_caption
 from app.services.fb_graph import upload_video_to_facebook
+from app.services.campaign_jobs import queue_affiliate_comment_for_video
 from app.services.observability import record_event, update_worker_heartbeat
 from app.services.security import decrypt_secret
 from app.worker.tasks import process_task_queue
@@ -96,15 +97,27 @@ def auto_post_job():
             )
 
             if "id" in res:
-                vid.fb_post_id = res["id"]
+                vid.fb_video_id = res.get("video_id") or res["id"]
+                vid.fb_post_id = res.get("post_id") or res["id"]
+                vid.fb_permalink_url = res.get("permalink_url")
                 vid.status = VideoStatus.posted
                 vid.last_error = None
+                affiliate_task = queue_affiliate_comment_for_video(db, vid, page)
                 record_event(
                     "video",
                     "info",
                     "Đã đăng video thành công.",
                     db=db,
-                    details={"video_id": str(vid.id), "page_id": page.page_id, "fb_post_id": vid.fb_post_id},
+                    details={
+                        "video_id": str(vid.id),
+                        "page_id": page.page_id,
+                        "fb_video_id": vid.fb_video_id,
+                        "fb_post_id": vid.fb_post_id,
+                        "affiliate_comment_status": vid.affiliate_comment_status.value
+                        if isinstance(vid.affiliate_comment_status, AffiliateCommentStatus)
+                        else str(vid.affiliate_comment_status),
+                        "affiliate_task_id": affiliate_task.get("task_id") if affiliate_task else None,
+                    },
                 )
                 if vid.file_path and os.path.exists(vid.file_path):
                     try:

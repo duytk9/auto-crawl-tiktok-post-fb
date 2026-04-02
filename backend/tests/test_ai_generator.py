@@ -1,6 +1,64 @@
 from app.services import ai_generator
 
 
+def split_caption_parts(caption: str):
+    tokens = caption.split()
+    body_tokens = [token for token in tokens if not token.startswith("#")]
+    hashtag_tokens = [token for token in tokens if token.startswith("#")]
+    return " ".join(body_tokens), hashtag_tokens
+
+
+def test_generate_caption_requests_15_to_20_words_with_compact_hashtags(monkeypatch):
+    captured = {}
+
+    def fake_generate(prompt, fallback, **kwargs):
+        captured["prompt"] = prompt
+        captured["fallback"] = fallback
+        return "Mẫu bàn phím này gõ êm, led đẹp, chơi game mượt và nhìn setup cực nổi bật luôn đó"
+
+    monkeypatch.setattr(ai_generator, "_generate_with_gemini", fake_generate)
+
+    caption = ai_generator.generate_caption("Bàn phím gaming led đẹp #gear #gaming")
+
+    assert "15 đến 20 từ" in captured["prompt"]
+    assert "thêm đúng 4 hashtag viết liền không dấu" in captured["prompt"]
+    body, hashtag_tokens = split_caption_parts(caption)
+    assert 15 <= len(body.split()) <= 20
+    assert len(hashtag_tokens) == 4
+    assert all(tag == tag.lower() and " " not in tag for tag in hashtag_tokens)
+    assert "#viral" in hashtag_tokens
+    assert "#trending" in hashtag_tokens
+
+
+def test_generate_caption_trims_when_gemini_returns_too_many_words(monkeypatch):
+    monkeypatch.setattr(
+        ai_generator,
+        "_generate_with_gemini",
+        lambda prompt, fallback, **kwargs: (
+            "Mẫu chuột này cầm ôm tay, click chắc, rê mượt, pin ổn, chơi game lâu vẫn nhẹ tay và rất đáng nâng cấp ngay"
+        ),
+    )
+
+    caption = ai_generator.generate_caption("Chuột gaming không dây nhẹ")
+
+    body, _ = split_caption_parts(caption)
+    assert len(body.split()) == 20
+
+
+def test_generate_caption_prefers_chinese_and_dance_hashtags(monkeypatch):
+    monkeypatch.setattr(
+        ai_generator,
+        "_generate_with_gemini",
+        lambda prompt, fallback, **kwargs: "Gái xinh Trung Quốc nhảy cực cuốn, thần thái nổi bật, xem là mê ngay từ ánh nhìn đầu tiên",
+    )
+
+    caption = ai_generator.generate_caption("Gái xinh Trung Quốc nhảy cực cháy trên phố")
+
+    _, hashtags = split_caption_parts(caption)
+    assert "#gaixinhtrungquoc" in hashtags
+    assert "#gaixinhnhay" in hashtags
+
+
 def test_generate_message_reply_with_context_requests_json_mode(monkeypatch):
     captured = {}
 

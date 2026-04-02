@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from app.api.auth import require_admin, require_authenticated_user
 from app.core.database import get_db
 from app.models.models import Campaign, FacebookPage, InboxConversation, InboxMessageLog, InteractionLog, TaskQueue, User
+from app.services.campaign_jobs import has_affiliate_comment_options
 from app.services.observability import record_event
 from app.services.security import decrypt_secret, encrypt_secret, is_secret_encrypted, mask_secret
 from app.services.fb_graph import inspect_page_access, inspect_page_messenger_subscription, inspect_user_pages, subscribe_page_to_app
@@ -40,6 +41,10 @@ class FacebookAutomationUpdate(BaseModel):
     message_reply_start_time: str = Field(default="08:00", pattern=r"^\d{2}:\d{2}$")
     message_reply_end_time: str = Field(default="22:00", pattern=r"^\d{2}:\d{2}$")
     message_reply_cooldown_minutes: int = Field(default=0, ge=0, le=1440)
+    affiliate_comment_enabled: bool = False
+    affiliate_comment_text: str | None = None
+    affiliate_link_url: str | None = None
+    affiliate_comment_delay_seconds: int = Field(default=60, ge=0, le=3600)
 
 
 def _normalize_time_string(value: str, *, field_name: str) -> str:
@@ -108,6 +113,10 @@ def serialize_page_config(page: FacebookPage) -> dict:
         "message_reply_start_time": page.message_reply_start_time or "08:00",
         "message_reply_end_time": page.message_reply_end_time or "22:00",
         "message_reply_cooldown_minutes": page.message_reply_cooldown_minutes or 0,
+        "affiliate_comment_enabled": bool(page.affiliate_comment_enabled),
+        "affiliate_comment_text": page.affiliate_comment_text or "",
+        "affiliate_link_url": page.affiliate_link_url or "",
+        "affiliate_comment_delay_seconds": page.affiliate_comment_delay_seconds or 60,
     }
 
 
@@ -511,6 +520,18 @@ def update_facebook_automation(page_id: str, payload: FacebookAutomationUpdate, 
     if not page:
         raise HTTPException(status_code=404, detail="Không tìm thấy fanpage cần cập nhật.")
 
+    affiliate_comment_text = (payload.affiliate_comment_text or "").strip()
+    affiliate_link_url = (payload.affiliate_link_url or "").strip()
+    preview_page = FacebookPage(
+        affiliate_comment_text=affiliate_comment_text or None,
+        affiliate_link_url=affiliate_link_url or None,
+    )
+    if payload.affiliate_comment_enabled and not has_affiliate_comment_options(preview_page):
+        raise HTTPException(
+            status_code=400,
+            detail="Khi bật comment affiliate, bạn cần nhập ít nhất một nội dung hoặc một link affiliate.",
+        )
+
     page.comment_auto_reply_enabled = payload.comment_auto_reply_enabled
     page.comment_ai_prompt = (payload.comment_ai_prompt or "").strip() or None
     page.message_auto_reply_enabled = payload.message_auto_reply_enabled
@@ -519,6 +540,10 @@ def update_facebook_automation(page_id: str, payload: FacebookAutomationUpdate, 
     page.message_reply_start_time = _normalize_time_string(payload.message_reply_start_time, field_name="Giờ bắt đầu")
     page.message_reply_end_time = _normalize_time_string(payload.message_reply_end_time, field_name="Giờ kết thúc")
     page.message_reply_cooldown_minutes = payload.message_reply_cooldown_minutes
+    page.affiliate_comment_enabled = payload.affiliate_comment_enabled
+    page.affiliate_comment_text = affiliate_comment_text or None
+    page.affiliate_link_url = affiliate_link_url or None
+    page.affiliate_comment_delay_seconds = payload.affiliate_comment_delay_seconds
     db.commit()
     db.refresh(page)
 
@@ -535,6 +560,8 @@ def update_facebook_automation(page_id: str, payload: FacebookAutomationUpdate, 
             "message_reply_start_time": page.message_reply_start_time,
             "message_reply_end_time": page.message_reply_end_time,
             "message_reply_cooldown_minutes": page.message_reply_cooldown_minutes,
+            "affiliate_comment_enabled": page.affiliate_comment_enabled,
+            "affiliate_comment_delay_seconds": page.affiliate_comment_delay_seconds,
         },
     )
     return {
